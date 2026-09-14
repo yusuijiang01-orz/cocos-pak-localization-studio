@@ -34,6 +34,22 @@ XLSX_MAPPING_VERSION = 6
 LEGACY_XLSX_MAPPING_VERSIONS = {3, 4, 5}
 XLSX_MAPPING_MODE = "xlsx-dedup-cells-compact"
 XLSX_SCOPE = "player-visible-only"
+
+_STRUCTURAL_XLSX_RE = re.compile(
+    r"(?:^\s*(?:\{|\[).*(?:\}|\])\s*$)"
+    r"|(?:\]\s*\*\*\s*[{}]|\*\*\s*[{}])"
+    r"|(?:^\s*(?:px\)\s*)?\{.*\}\s*$)"
+    r"|(?:\b(?:function|local|return|elseif|then|end)\b\s*[^\n]*[=(){};])",
+    re.I | re.S,
+)
+
+def _is_structural_xlsx_text(text: str) -> bool:
+    s = (text or '').strip()
+    if not s:
+        return False
+    if ((s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']'))) and (':' in s or '"' in s or "'" in s):
+        return True
+    return bool(_STRUCTURAL_XLSX_RE.search(s))
 MULTI_XLSX_MAPPING_VERSION = 7
 MULTI_XLSX_MAPPING_MODE = "multi-pak-out-of-band-skeleton"
 TRANSPORT_MARKER_RE = re.compile(r"(?:◈|\{P\s*\d+\}|ZXQROW|<\/?ph(?:\s|>|/))", re.I)
@@ -708,6 +724,11 @@ def export_xlsx_mapping(src_dir: Path, out_dir: Path, base_name: str, pak_name: 
         for rec in visible_records:
             source = str(rec.get("source_original", rec.get("original", "")) or "")
             if not source:
+                continue
+            # Defense in depth: old projects may contain records admitted by a
+            # pre-fix analyzer. Never export JSON/script/control payloads.
+            if _is_structural_xlsx_text(source):
+                excluded_not_visible += 1
                 continue
             row_no = int(rec.get("line") or 0)
             col_no = int(rec.get("column") or 0)

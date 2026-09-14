@@ -83,6 +83,27 @@ VISIBLE_TSV_HEADER_RE=re.compile(r'(?:^|_)(?:npc_?name|name|title|text|string|in
 INTERNAL_TSV_HEADER_RE=re.compile(r'(?:^|_)(?:id|res(?:ource)?|idx|index|code|path|file|image|icon|spr|anim(?:ation)?|script|function|param|value|type|kind|genre|detail|particular|level|map|width|height|price|count|weight|quantity|series|option|flag|time|lock|trade|drop|x|y|z|skill\d+)(?:$|_)|(?:资源|动画|文件|路径|索引|编号|种类|类别|类型|数值|最小值|最大值|属性|价格|等级|宽度|高度|负重|标记|时间|是否|装备id|套装id|resid)|技能\d+',re.I)
 INTERNAL_INI_KEY_RE=re.compile(r'(?:^|_)(?:id|res(?:ource)?|idx|index|code|path|file|image|icon|spr|anim(?:ation)?|script|function|param|value|type|kind|level|map|width|height|x|y|z|color|font|sound|music|offset|frame|count|time|flag)(?:$|_)',re.I)
 RESOURCE_EXTS=('spr','bmp','png','jpg','jpeg','gif','dds','tga','wav','mp3','ogg','mid','ani','cur','ico','ttf','fnt','ini','lua','txt','tsv','csv','xml','json','pak','dat','bin')
+
+# Text that is embedded data/code, not a player-facing sentence.  This guard
+# deliberately runs after decoding but before a record is admitted to the
+# translation allowlist.  A natural-language fragment inside JSON or a game
+# control expression must never make the whole payload translatable.
+STRUCTURAL_TEXT_RE = re.compile(
+    r"(?:^\s*(?:\{|\[).*(?:\}|\])\s*$)"
+    r"|(?:\]\s*\*\*\s*[{}]|\*\*\s*[{}])"
+    r"|(?:^\s*(?:px\)\s*)?\{.*\}\s*$)"
+    r"|(?:\b(?:function|local|return|elseif|then|end)\b\s*[^\n]*[=(){};])",
+    re.I | re.S,
+)
+
+def is_structural_translation_payload(text:str)->bool:
+    s=(text or '').strip()
+    if not s:
+        return False
+    # JSON/object/array payloads, including compact one-line dialogue tables.
+    if ((s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']'))) and (':' in s or '"' in s or "'" in s):
+        return True
+    return bool(STRUCTURAL_TEXT_RE.search(s))
 RESOURCE_KEYS={'image','spr','bkimage','smallbackimage','splitimage','pointimage','maleimage','femaleimage','imgfile_0','imgfile_1','imgfile_2','imgfile_3','imgfile_4','imgfile_5','captainflagimage_0','captainflagimage_1','captainflagimage_2','font','sound','music','texture','icon','filename','file','path'}
 MOJIBAKE_HINTS={'脿','峄','岷','霉','铆','啤','农','锚','谩','瓢','芒','膩','獜','牰','楜','瑩','浥','出来'}
 UTF8_LEGACY_MOJIBAKE_RE=re.compile(r'[ĂĐưƠƯÀ-ỹµÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ³»¼½¾¿]{4,}')
@@ -544,6 +565,9 @@ def _analyze_one_file(args):
         if is_resource_reference_bytes(val_b,key_b):
             continue
         text,enc,lang,score=decode_best(val_b)
+        if is_structural_translation_payload(text):
+            stats['excluded_structural'] += 1
+            continue
         if text.strip().lower() in {'abc','test','测试','null','none','n/a'}: continue
         if is_resource_reference(text,key): continue
         if not has_editable_natural_text(text): continue
