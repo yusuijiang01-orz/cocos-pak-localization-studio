@@ -90,7 +90,7 @@ def test_multi_pak_import_restores_exact_tokens_and_fills_missing_rows(tmp_path)
     assert imported['untranslated_allowed'] is True
 
 
-def test_multi_pak_import_accepts_normal_chinese_slash_and_number_words(tmp_path):
+def test_multi_pak_import_rejects_chinese_text_with_runtime_punctuation(tmp_path):
     records_path = tmp_path / 'records.json'
     records_path.write_text(json.dumps([{
         'id': 'a', 'pak': 'settings.pak', 'source_file': '1.ini', 'line': 2, 'column': 1,
@@ -106,8 +106,8 @@ def test_multi_pak_import_accepts_normal_chinese_slash_and_number_words(tmp_path
     write_simple_xlsx(Path(report['xlsx']), rows, headers=['id', 'pak', 'source_file', 'text'])
     imported = apply_multi_pak_full_xlsx_to_records(records_path, Path(report['xlsx']), Path(report['mapping']))
     final = json.loads(records_path.read_text(encoding='utf-8'))[0]['original']
-    assert final == '$学校/派系：#s1-'
-    assert imported['rejected_segments'] == 0
+    assert final == '$Hệ phái:#s1-'
+    assert imported['rejected_segments'] == 1
 
 
 def test_remaining_workbook_is_sparse_and_preserves_existing_chinese(tmp_path):

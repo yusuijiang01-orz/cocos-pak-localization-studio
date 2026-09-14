@@ -42,6 +42,9 @@ _STRUCTURAL_XLSX_RE = re.compile(
     r"|(?:\b(?:function|local|return|elseif|then|end)\b\s*[^\n]*[=(){};])",
     re.I | re.S,
 )
+_UNSAFE_IMPORT_TEXT_RE = re.compile(r"[<>{}\[\]/\\#$%`=;|&^]")
+_LATIN_OR_VIETNAMESE_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]")
+_HAN_RE = re.compile(r"[\u3400-\u9FFF]")
 
 def _is_structural_xlsx_text(text: str) -> bool:
     s = (text or '').strip()
@@ -50,6 +53,13 @@ def _is_structural_xlsx_text(text: str) -> bool:
     if ((s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']'))) and (':' in s or '"' in s or "'" in s):
         return True
     return bool(_STRUCTURAL_XLSX_RE.search(s))
+
+def _is_safe_pure_chinese_import(text: str) -> bool:
+    """Accept only a plain Chinese translation cell for the strict safe flow."""
+    s = (text or "").strip()
+    return bool(s and _HAN_RE.search(s)
+                and not _UNSAFE_IMPORT_TEXT_RE.search(s)
+                and not _LATIN_OR_VIETNAMESE_RE.search(s))
 MULTI_XLSX_MAPPING_VERSION = 7
 MULTI_XLSX_MAPPING_MODE = "multi-pak-out-of-band-skeleton"
 TRANSPORT_MARKER_RE = re.compile(r"(?:◈|\{P\s*\d+\}|ZXQROW|<\/?ph(?:\s|>|/))", re.I)
@@ -1198,6 +1208,17 @@ def apply_multi_pak_full_xlsx_to_records(records_path: Path, xlsx_path: Path,
                 rejected_segment_ids.add(segment_id)
                 if len(rejected_examples) < 50:
                     rejected_examples.append({"id": segment_id, "reason": "译文凭空加入数字，已用原文片段补全"})
+                value = segment_source
+                record_missing = True
+            elif not _is_safe_pure_chinese_import(value):
+                # Strict user-selected import profile: text containing legacy
+                # Vietnamese/Latin glyphs or runtime punctuation must never
+                # enter modified resources. Preserve the exported source
+                # instead and report it as unresolved.
+                rejected_segments += 1
+                rejected_segment_ids.add(segment_id)
+                if len(rejected_examples) < 50:
+                    rejected_examples.append({"id": segment_id, "reason": "译文不是纯中文安全文本，已用原文片段补全"})
                 value = segment_source
                 record_missing = True
             output.append(value)
