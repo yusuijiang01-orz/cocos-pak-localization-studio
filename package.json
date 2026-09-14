@@ -1,0 +1,13 @@
+{
+  "name": "cocos-pak-localization-studio",
+  "version": "3.0.4",
+  "description": "Cocos2D / Kingsoft PACK localization text extraction studio",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^37.2.0"
+  }
+}

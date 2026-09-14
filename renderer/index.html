@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Cocos2D PAK Localization Studio</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <header>
+    <div>
+      <h1>Cocos2D PAK Localization Studio</h1>
+      <div class="subtitle">V3-A Hotfix 5 · TSV/INI/TXT/LUA 文本资源本地化 / ID 精确导入 / 精简 CSV</div>
+    </div>
+    <div class="actions">
+      <button id="translatorSettings" class="secondary">翻译设置</button>
+      <button id="openProject" class="secondary">打开项目</button>
+      <button id="importPaks">导入 PAK</button>
+    </div>
+  </header>
+
+  <main>
+    <aside class="sidebar">
+      <div class="panel-title">PAK</div>
+      <div id="pakList" class="category-list"></div>
+      <div class="panel-title spaced">文件类型</div>
+      <div id="typeList" class="category-list"></div>
+      <div class="panel-title spaced">内容范围</div>
+      <div id="scopeList" class="category-list"></div>
+      <div class="panel-title spaced">文件汉化率</div>
+      <div id="fileCoverageList" class="file-coverage-list"></div>
+      <div class="panel-title spaced">语言状态</div>
+      <div id="langList" class="category-list"></div>
+      <div class="panel-title spaced">处理状态</div>
+      <div id="statusList" class="category-list"></div>
+    </aside>
+
+    <section class="content">
+      <div class="toolbar">
+        <input id="search" placeholder="搜索 ID 或文本…" />
+        <button id="exportXlsx">导出 XLSX</button>
+        <button id="importXlsxPolish">导入润色</button>
+        <button id="apiReview">API 审校</button>
+        <button id="reReviewSelected" class="secondary" disabled>重新审核</button>
+        <button id="exportUntranslated">导出未翻译</button>
+        <button id="ollamaTranslate">Ollama 翻译</button>
+        <button id="importUntranslated">导回翻译</button>
+        <button id="safePcMerge">国际版迁移中文</button>
+        <button id="buildPak">构建 PAK</button>
+        <div id="advancedTools" class="advanced-tools hidden">
+          <button id="pushGithubPak" class="secondary hidden" tabindex="-1" aria-hidden="true">推送 GitHub</button>
+          <button id="autoModelBuild" class="secondary">API 安全翻译并构建</button>
+          <button id="exportCsv" class="secondary">导出所选 PAK CSV</button>
+          <button id="importCsv" class="secondary">导入所选 PAK CSV</button>
+          <button id="exportTsvCsv" class="secondary">导出文本资源 CSV</button>
+          <button id="modelTranslateTsvCsv" class="secondary">模型翻译文本 CSV</button>
+          <button id="apiTranslateMergedCsv" class="secondary">API 翻译分片 CSV</button>
+          <button id="importTsvCsv" class="secondary">导入 CSV 还原文本资源</button>
+          <button id="mergeTsvCsv" class="secondary">合并未汉化 CSV</button>
+          <button id="splitMergedTsvCsv" class="secondary">拆分合并 CSV</button>
+          <button id="translateTsvCsv" class="secondary">脚本翻译文本 CSV</button>
+        </div>
+      </div>
+      <div class="summary-row"><div id="summary" class="summary">尚未导入项目</div><div class="pager"><button id="prevPage" class="secondary mini">上一页</button><span id="pageInfo">1 / 1</span><button id="nextPage" class="secondary mini">下一页</button></div></div>
+      <div class="table-wrap" id="tableWrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="select-col"><input id="selectReviewedPage" type="checkbox" title="选择当前页已审核内容" /></th><th class="file-col">来源文件</th><th class="pos-col">位置</th><th>当前文本</th><th class="lang-col">语言</th><th class="status-col">状态</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <aside class="detail">
+      <div class="panel-title">文本详情</div>
+      <div id="detailEmpty" class="empty">选择一条记录查看上下文。</div>
+      <div id="detailBody" class="detail-body hidden">
+        <div class="meta-grid" id="metaGrid"></div>
+        <label>原文</label>
+        <textarea id="originalText" readonly></textarea>
+        <div class="detail-field-heading"><label>当前本地化文本</label><button id="restoreOriginal" class="secondary mini" type="button">恢复原文</button></div>
+        <textarea id="translationText" placeholder="可在这里编辑；保存到工作区内部数据库，不会修改原 PAK。"></textarea>
+        <label>上下文</label>
+        <pre id="contextText"></pre>
+      </div>
+    </aside>
+  </main>
+
+  <footer>
+    <span id="projectPath">未加载项目</span>
+    <div class="footer-status">
+      <progress id="translationProgress" class="hidden" max="100" value="0"></progress>
+      <span id="progress">就绪</span>
+    </div>
+  </footer>
+</div>
+
+<div id="settingsModal" class="modal hidden">
+  <div class="modal-card settings-card">
+    <h2>翻译设置</h2>
+    <div class="form-row"><label>配置</label><div class="inline-row"><select id="apiProfile" class="field"></select><button id="newApiProfile" class="secondary">新增</button><button id="deleteApiProfile" class="secondary">删除</button></div></div>
+    <div class="form-row"><label>名称</label><input id="apiProfileName" class="field" placeholder="例如 Qwen3.6 云端 / 本机 Ollama" /></div>
+    <div class="form-row"><label>BaseURL</label><input id="apiBaseUrl" class="field" placeholder="https://.../v1 或 https://.../v1/chat/completions" /></div>
+    <div class="form-row"><label>API key</label><input id="apiKey" class="field" type="password" placeholder="sk-..." /></div>
+    <div class="form-row"><label>模型</label><div><div class="inline-row"><div class="model-picker"><input id="apiModel" class="field" placeholder="请点击获取模型按钮以获取模型" /><div id="apiModelDropdown" class="model-dropdown hidden"></div></div><button id="fetchApiModels" class="secondary">获取模型</button></div><div id="apiModelHint" class="muted">未获取模型</div></div></div>
+    <div class="form-row"><label>批量行数</label><div><input id="apiBatchSize" class="field" type="number" min="0" max="5000" value="0" /><div class="muted field-hint">0 表示自动：API 审校每批 20 条；超时、漏回 ID 或 JSON 异常时会自动拆小重试。</div></div></div>
+    <div class="form-row"><label>审校范围</label><select id="apiReviewMode" class="field"><option value="risk">仅风险项（省 Token）</option><option value="all">全部重新审校</option></select></div>
+    <div id="ollamaThinkRow" class="form-row hidden"><label for="ollamaThink">思考模式</label><input id="ollamaThink" type="checkbox" role="switch" title="Ollama 思考模式" /></div>
+    <div class="form-row wide"><label>提示词模板</label><textarea id="apiPrompt" class="field prompt-editor"></textarea></div>
+    <div class="muted">配置只保存在本机，不写入项目目录。API key 可留空以支持 Ollama。本工具会使用完整本地化 CSV 分片，并保持占位符符号不变。</div>
+    <div class="modal-actions"><button id="cancelSettings" class="secondary">取消</button><button id="saveSettings">保存设置</button></div>
+  </div>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>导入 PAK</h2>
+    <div class="form-row"><label>PAK 文件</label><div><button id="pickPaks" class="secondary">选择 PAK</button><div id="pakSelection" class="muted">未选择</div></div></div>
+    <div class="form-row"><label>工作区</label><div><button id="pickWorkspace" class="secondary">选择工作区</button><div id="workspaceSelection" class="muted">未选择</div></div></div>
+    <div id="importStatus" class="import-status hidden">
+      <progress id="importProgress"></progress>
+      <div id="importStatusText">准备开始</div>
+    </div>
+    <div class="modal-actions"><button id="cancelModal" class="secondary">取消</button><button id="runImport">开始分析</button></div>
+  </div>
+</div>
+
+<div id="appDialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle">
+  <div class="modal-card dialog-card">
+    <div class="dialog-heading">
+      <div id="appDialogMark" class="dialog-mark" aria-hidden="true">i</div>
+      <h2 id="appDialogTitle">提示</h2>
+    </div>
+    <div id="appDialogMessage" class="dialog-message"></div>
+    <div class="modal-actions dialog-actions">
+      <button id="appDialogAction" class="secondary hidden">一键恢复全部</button>
+      <button id="appDialogCancel" class="secondary hidden">取消</button>
+      <button id="appDialogConfirm">确定</button>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
