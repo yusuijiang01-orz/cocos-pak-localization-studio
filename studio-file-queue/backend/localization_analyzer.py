@@ -536,7 +536,10 @@ def iter_units(path:Path):
 
 def is_candidate_bytes(b:bytes)->bool:
     s=b.strip()
-    if len(s)<2 or len(s)>4096: return False
+    # Excel accepts at most 32,767 characters in a cell.  The former 4 KiB
+    # scanner cap silently dropped legitimate long quest and story text.
+    # Keep the analysis limit aligned with the export format instead.
+    if len(s)<2 or len(s)>32767: return False
     # Fast-path: skip the huge volume of numeric/config cells before any codec work.
     if re.fullmatch(br'[0-9\s.,:+\-*/%(){}\[\]_=<>\\/|]+',s): return False
     if any(x>=128 for x in s): return True

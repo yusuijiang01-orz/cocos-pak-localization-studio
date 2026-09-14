@@ -1,6 +1,7 @@
 import struct
 import sys
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 
@@ -63,3 +64,18 @@ def test_rebuild_is_compact_and_preserves_untouched_payloads(tmp_path):
     # The former append-style algorithm was always source + changed payload + index.
     assert len(rebuilt) < len(source_blob) + len(nrv2b_compress(replacement)) + count * ENTRY_SIZE
 
+
+def test_rebuild_refuses_to_relabel_an_unsupported_compression_method(tmp_path):
+    source = tmp_path / 'source.pak'
+    _make_pak(source)
+    blob = bytearray(source.read_bytes())
+    _count, idx, _entries = _read_index(blob)
+    # Third entry starts at index + 2 * 16; change only its method marker.
+    blob[idx + 2 * ENTRY_SIZE + 15] = 17
+    source.write_bytes(blob)
+    modified = tmp_path / 'modified'
+    modified.mkdir()
+    (modified / '0002_22222222.ini').write_bytes('安全文本'.encode('utf-8'))
+
+    with pytest.raises(ValueError, match='compression method 17'):
+        rebuild_pak(source, modified, ['0002_22222222.ini'], tmp_path / 'rebuilt.pak')

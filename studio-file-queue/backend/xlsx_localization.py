@@ -930,8 +930,12 @@ def export_multi_pak_full_xlsx(records_path: Path, out_dir: Path, base_name: str
     metadata_dir = Path(metadata_dir) if metadata_dir is not None else out_dir
     selected = set(pak_names or [])
     records = json.loads(records_path.read_text(encoding="utf-8"))
+    # Old projects can contain records produced before the structural filter
+    # existed.  Multi-PAK export must enforce the same boundary as per-file
+    # export; otherwise JSON/script records re-enter the workbook here.
     visible = [rec for rec in records
                if rec.get("_isPlayerVisible", True) is True
+               and not _is_structural_xlsx_text(str(rec.get("source_original") or rec.get("original") or ""))
                and (not selected or rec.get("pak") in selected)]
     if not visible:
         raise ValueError("没有检测到可导出的玩家可见文本")
@@ -1114,6 +1118,11 @@ def apply_multi_pak_full_xlsx_to_records(records_path: Path, xlsx_path: Path,
         record_id, pak, _source_file, _line, _column, source, skeleton = item
         rec = record_map.get(str(record_id))
         if rec is None or rec.get("pak") != pak or rec.get("_isPlayerVisible", True) is not True:
+            stale_records += 1
+            continue
+        # Never allow a pre-fix mapping to write a structured data payload
+        # back into a PAK.  It is neither source text nor player-visible text.
+        if _is_structural_xlsx_text(str(source or "")):
             stale_records += 1
             continue
         canonical_source = str(rec.get("source_original") or source)

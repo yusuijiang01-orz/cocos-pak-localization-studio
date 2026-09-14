@@ -307,6 +307,15 @@ def rebuild_pak(original_pak:Path,modified_dir:Path,changed_files:list[str],outp
                 p=files_by_idx.get(e['index'])
                 if not p:
                     raise ValueError(f'Modified entry file missing: {e["index"]}')
+                # The builder implements NRV2B method 1 only.  Re-labeling a
+                # method-17 stream as method 1 can pass our own extractor yet
+                # crash the game's native reader.  Refuse that transformation
+                # until the original method has a verified encoder.
+                if e['method'] != 1:
+                    raise ValueError(
+                        f'Entry {e["index"]} uses compression method {e["method"]}; '
+                        'this Studio cannot safely rewrite it. Keep the original payload.'
+                    )
                 raw=p.read_bytes()
                 packed_data=nrv2b_compress(raw)
                 real=len(raw); method=1
