@@ -96,6 +96,12 @@ CREATE TABLE IF NOT EXISTS review_actions(
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_actions_unit ON review_actions(unit_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS blocked_targets(
+  unit_id TEXT NOT NULL REFERENCES translation_units(unit_id) ON DELETE CASCADE,
+  target_fingerprint TEXT NOT NULL,target_text TEXT NOT NULL,origin TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,
+  PRIMARY KEY(unit_id,target_fingerprint)
+);
 CREATE TABLE IF NOT EXISTS build_snapshots(
   build_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,source_manifest_json TEXT NOT NULL,
   target_manifest_json TEXT NOT NULL DEFAULT '{}',verification_json TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL
