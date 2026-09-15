@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile vNext backend
         run: |
-          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py backend/vnext_compat_cli.py
+          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py backend/vnext_compat_cli.py backend/vnext_phase7_cli.py
 
       - name: Phase 1 tests
         run: python backend/test_vnext_phase1.py
