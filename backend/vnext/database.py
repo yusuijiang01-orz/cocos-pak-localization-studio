@@ -45,13 +45,15 @@ CREATE TABLE IF NOT EXISTS translation_units(
   created_at TEXT NOT NULL,updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS occurrences(
-  occurrence_id TEXT PRIMARY KEY,unit_id TEXT NOT NULL REFERENCES translation_units(unit_id) ON DELETE CASCADE,
+  occurrence_id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+  unit_id TEXT NOT NULL REFERENCES translation_units(unit_id) ON DELETE CASCADE,
   record_id TEXT NOT NULL DEFAULT '',pak_name TEXT NOT NULL,source_file TEXT NOT NULL,
   locator_json TEXT NOT NULL DEFAULT '{}',skeleton_json TEXT NOT NULL DEFAULT '[]',
   source_fingerprint TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_occ_project_active ON occurrences(project_id,active);
 CREATE INDEX IF NOT EXISTS idx_occ_unit ON occurrences(unit_id);
-CREATE INDEX IF NOT EXISTS idx_occ_pak_file ON occurrences(pak_name,source_file);
+CREATE INDEX IF NOT EXISTS idx_occ_pak_file ON occurrences(project_id,pak_name,source_file);
 CREATE TABLE IF NOT EXISTS current_targets(
   unit_id TEXT PRIMARY KEY REFERENCES translation_units(unit_id) ON DELETE CASCADE,target_text TEXT NOT NULL,
   target_status TEXT NOT NULL,origin TEXT NOT NULL,knowledge_ref TEXT NOT NULL DEFAULT '',
@@ -154,15 +156,15 @@ def upsert_unit(db: sqlite3.Connection, candidate: TranslationUnitCandidate) -> 
     return candidate.unit_id
 
 
-def add_occurrence(db: sqlite3.Connection, *, unit_id: str, record_id: str, pak_name: str, source_file: str,
-                   source_fingerprint: str, locator: dict[str, Any] | None = None,
+def add_occurrence(db: sqlite3.Connection, *, project_id: str, unit_id: str, record_id: str, pak_name: str,
+                   source_file: str, source_fingerprint: str, locator: dict[str, Any] | None = None,
                    skeleton: list[dict[str, Any]] | None = None) -> str:
-    now = utcnow(); oid = stable_id("o_",pak_name,source_file,record_id,source_fingerprint)
-    db.execute("""INSERT INTO occurrences(occurrence_id,unit_id,record_id,pak_name,source_file,locator_json,
-      skeleton_json,source_fingerprint,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)
+    now = utcnow(); oid = stable_id("o_",project_id,pak_name,source_file,record_id,source_fingerprint)
+    db.execute("""INSERT INTO occurrences(occurrence_id,project_id,unit_id,record_id,pak_name,source_file,locator_json,
+      skeleton_json,source_fingerprint,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)
       ON CONFLICT(occurrence_id) DO UPDATE SET unit_id=excluded.unit_id,locator_json=excluded.locator_json,
       skeleton_json=excluded.skeleton_json,source_fingerprint=excluded.source_fingerprint,active=1,updated_at=excluded.updated_at""",
-      (oid,unit_id,record_id,pak_name,source_file,json.dumps(locator or {},ensure_ascii=False,separators=(",",":")),
+      (oid,project_id,unit_id,record_id,pak_name,source_file,json.dumps(locator or {},ensure_ascii=False,separators=(",",":")),
        json.dumps(skeleton or [],ensure_ascii=False,separators=(",",":")),source_fingerprint,now,now))
     return oid
 
