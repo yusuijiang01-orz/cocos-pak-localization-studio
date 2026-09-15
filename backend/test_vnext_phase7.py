@@ -20,7 +20,7 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def make_single_entry_pak(path: Path, raw: bytes, hid: int = 0x12345678) -> None:
+def make_single_entry_pak(path: Path, raw: bytes, hid: int) -> None:
     packed = nrv2b_compress(raw)
     offset = 32
     index_offset = offset + len(packed)
@@ -40,67 +40,94 @@ class Phase7EndToEndTests(unittest.TestCase):
         self.root = Path(self.td.name)
         self.workspace = self.root / 'workspace'
         self.workspace.mkdir(parents=True)
-        self.original = self.root / 'settings.pak'
-        self.raw = '[UI]\r\nText=Hoàn thành nhiệm vụ\r\n'.encode('utf-8')
-        make_single_entry_pak(self.original, self.raw)
-        self.original_sha = sha256(self.original)
-
-        self.extracted = self.root / 'settings_unpacked'
-        out, count, ok, fail, methods, types = extract_one(self.original, self.extracted, workers=1)
-        self.assertEqual(out, self.extracted)
-        self.assertEqual((count, ok, fail), (1, 1, 0))
-        self.assertEqual(methods, {1: 1})
-        self.assertTrue((self.extracted / '0000_12345678.ini').is_file())
-
         (self.workspace / 'localization').mkdir(parents=True)
-        records = [
+
+        specs = [
             {
-                'id': 'phase7_record_1',
                 'pak': 'settings.pak',
-                'source_file': '0000_12345678.ini',
-                'line': 2,
-                'column': 1,
-                'key': 'Text',
-                'encoding': 'utf-8',
-                'original': 'Hoàn thành nhiệm vụ',
-                'source_original': 'Hoàn thành nhiệm vụ',
-                '_isPlayerVisible': True,
-            }
+                'hid': 0x12345678,
+                'raw': '[UI]\r\nText=Hoàn thành nhiệm vụ\r\n'.encode('utf-8'),
+                'file': '0000_12345678.ini',
+                'record': {
+                    'id': 'phase7_settings_1', 'line': 2, 'column': 1, 'key': 'Text',
+                    'source': 'Hoàn thành nhiệm vụ', 'target': '完成任务',
+                },
+            },
+            {
+                'pak': 'updatefs.pak',
+                'hid': 0x23456789,
+                'raw': 'id\tname\r\n1\tBăng Hỏa Long Châu\r\n'.encode('utf-8'),
+                'file': '0000_23456789.tsv',
+                'record': {
+                    'id': 'phase7_updatefs_1', 'line': 2, 'column': 2, 'key': '',
+                    'source': 'Băng Hỏa Long Châu', 'target': '冰火龙珠',
+                },
+            },
+            {
+                'pak': 'ui.pak',
+                'hid': 0x3456789A,
+                'raw': 'Nhận thưởng\r\n'.encode('utf-8'),
+                'file': '0000_3456789A.txt',
+                'record': {
+                    'id': 'phase7_ui_1', 'line': 1, 'column': 1, 'key': '',
+                    'source': 'Nhận thưởng', 'target': '领取奖励',
+                },
+            },
         ]
+
+        project_paks = []
+        records = []
+        self.original_shas = {}
+        self.specs = specs
+        for spec in specs:
+            original = self.root / spec['pak']
+            make_single_entry_pak(original, spec['raw'], spec['hid'])
+            self.original_shas[spec['pak']] = sha256(original)
+            extracted = self.root / f"{Path(spec['pak']).stem}_unpacked"
+            out, count, ok, fail, methods, _types = extract_one(original, extracted, workers=1)
+            self.assertEqual(out, extracted)
+            self.assertEqual((count, ok, fail), (1, 1, 0))
+            self.assertEqual(methods, {1: 1})
+            self.assertTrue((extracted / spec['file']).is_file())
+            project_paks.append({'pak': spec['pak'], 'path': str(original), 'extracted': str(extracted)})
+            rec = spec['record']
+            records.append(
+                {
+                    'id': rec['id'],
+                    'pak': spec['pak'],
+                    'source_file': spec['file'],
+                    'line': rec['line'],
+                    'column': rec['column'],
+                    'key': rec['key'],
+                    'encoding': 'utf-8',
+                    'original': rec['source'],
+                    'source_original': rec['source'],
+                    '_isPlayerVisible': True,
+                }
+            )
+
         (self.workspace / 'localization' / 'text_records.json').write_text(
             json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8'
         )
         (self.workspace / 'project.json').write_text(
-            json.dumps(
-                {
-                    'workspace': str(self.workspace),
-                    'paks': [
-                        {
-                            'pak': 'settings.pak',
-                            'path': str(self.original),
-                            'extracted': str(self.extracted),
-                        }
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps({'workspace': str(self.workspace), 'paks': project_paks}, ensure_ascii=False, indent=2),
             encoding='utf-8',
         )
         self.project_db = self.workspace / 'vnext' / 'project.sqlite3'
         self.knowledge_db = self.root / 'knowledge.sqlite3'
         init_knowledge_db(self.knowledge_db).close()
         report = ingest_workspace_records(self.workspace, self.project_db, project_name='phase7 synthetic')
-        self.assertEqual(report['active_unique_units'], 1)
-        self.assertEqual(report['active_occurrences'], 1)
+        self.assertEqual(report['active_unique_units'], 3)
+        self.assertEqual(report['active_occurrences'], 3)
 
     def tearDown(self):
         self.td.cleanup()
 
-    def _set_safe_target(self, target: str = '完成任务') -> str:
+    def _set_target_for_source(self, source: str, target: str) -> str:
         db = init_project_db(self.project_db)
         try:
-            row = db.execute('SELECT unit_id FROM translation_units LIMIT 1').fetchone()
+            row = db.execute('SELECT unit_id FROM translation_units WHERE source_text=?', (source,)).fetchone()
+            self.assertIsNotNone(row, source)
             unit_id = row['unit_id']
             db.execute(
                 """INSERT OR REPLACE INTO current_targets(
@@ -113,8 +140,13 @@ class Phase7EndToEndTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_full_vnext_materialize_rebuild_reextract_roundtrip(self):
-        self._set_safe_target('完成任务')
+    def _set_all_safe_targets(self) -> None:
+        for spec in self.specs:
+            rec = spec['record']
+            self._set_target_for_source(rec['source'], rec['target'])
+
+    def test_three_pak_materialize_rebuild_reextract_roundtrip(self):
+        self._set_all_safe_targets()
         gate = preflight_build(
             self.project_db,
             self.knowledge_db,
@@ -122,6 +154,7 @@ class Phase7EndToEndTests(unittest.TestCase):
             fail_on_warnings=True,
         )
         self.assertTrue(gate['ok'], gate)
+        self.assertEqual(gate['translated_unique'], 3)
 
         output_dir = self.workspace / 'build-vnext'
         report = build_verified_paks(
@@ -129,25 +162,26 @@ class Phase7EndToEndTests(unittest.TestCase):
             project_db_path=self.project_db,
             knowledge_db_path=self.knowledge_db,
             output_dir=output_dir,
-            pak_names=['settings.pak'],
+            pak_names=['settings.pak', 'updatefs.pak', 'ui.pak'],
             workers=1,
             require_translated=True,
             fail_on_warnings=True,
         )
         self.assertTrue(report['ok'], report)
-        built = output_dir / 'settings.pak'
-        self.assertTrue(built.is_file())
-        self.assertEqual(sha256(self.original), self.original_sha, 'original PAK must remain byte-identical')
-        self.assertNotEqual(sha256(built), self.original_sha, 'translated candidate must differ from original')
 
-        verify_dir = self.root / 'verify-final'
-        _out, count, ok, fail, _methods, _types = extract_one(built, verify_dir, workers=1)
-        self.assertEqual((count, ok, fail), (1, 1, 0))
-        rebuilt_resource = (verify_dir / '0000_12345678.ini').read_bytes()
-        decoded = decode_best(rebuilt_resource)[0]
-        self.assertIn('Text=', decoded)
-        self.assertIn('完成任务', decoded)
-        self.assertNotIn('Hoàn thành nhiệm vụ', decoded)
+        for spec in self.specs:
+            original = self.root / spec['pak']
+            built = output_dir / spec['pak']
+            self.assertTrue(built.is_file(), spec['pak'])
+            self.assertEqual(sha256(original), self.original_shas[spec['pak']], 'original PAK must remain byte-identical')
+            self.assertNotEqual(sha256(built), self.original_shas[spec['pak']], 'translated candidate must differ from original')
+            verify_dir = self.root / f"verify_{Path(spec['pak']).stem}"
+            _out, count, ok, fail, _methods, _types = extract_one(built, verify_dir, workers=1)
+            self.assertEqual((count, ok, fail), (1, 1, 0))
+            rebuilt_resource = (verify_dir / spec['file']).read_bytes()
+            decoded = decode_best(rebuilt_resource)[0]
+            self.assertIn(spec['record']['target'], decoded)
+            self.assertNotIn(spec['record']['source'], decoded)
 
         db = init_project_db(self.project_db)
         try:
@@ -156,11 +190,14 @@ class Phase7EndToEndTests(unittest.TestCase):
             self.assertEqual(snap['status'], 'verified')
             verification = json.loads(snap['verification_json'])
             self.assertTrue(verification['preflight']['ok'])
+            statuses = {item['pak']: item['status'] for item in verification['paks']}
+            self.assertEqual(statuses, {'settings.pak': 'verified', 'updatefs.pak': 'verified', 'ui.pak': 'verified'})
         finally:
             db.close()
 
     def test_final_gate_blocks_structure_damaging_target(self):
-        self._set_safe_target('完成{P1}任务')
+        self._set_all_safe_targets()
+        self._set_target_for_source('Hoàn thành nhiệm vụ', '完成{P1}任务')
         gate = preflight_build(
             self.project_db,
             self.knowledge_db,
