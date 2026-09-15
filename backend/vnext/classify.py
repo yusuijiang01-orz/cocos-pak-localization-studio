@@ -17,7 +17,11 @@ VI_DIACRITIC_RE = re.compile(
 LATIN_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u1e00-\u1eff]")
 WORD_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u1e00-\u1eff]+|[\u3400-\u9fff]+")
 SENTENCE_MARK_RE = re.compile(r"[.!?。！？:：;,，；]|[\r\n]")
-MOJIBAKE_RE = re.compile(r"[\ufffd]|(?:Ã.|Â.|Æ.|á»|áº|ï¿½)")
+# Do not flag standalone Â/Ã: both are valid Vietnamese letters and occur in real
+# proper names such as "Ân Hồng".  Mojibake from UTF-8 decoded as a legacy
+# single-byte codec instead contains the replacement marker, the characteristic
+# á»/áº sequences, or Ã/Â/Æ followed by a C1/Latin-1 continuation-like byte.
+MOJIBAKE_RE = re.compile(r"\ufffd|ï¿½|á»|áº|(?:Ã|Â|Æ)[\u0080-\u00bf]")
 TECH_ONLY_RE = re.compile(
     r"^\s*(?:"
     r"[A-Za-z0-9_.:/\\@#$%+\-=()\[\]{}<>|,&*]+"
