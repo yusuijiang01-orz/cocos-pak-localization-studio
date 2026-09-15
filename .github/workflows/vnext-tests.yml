@@ -1,4 +1,4 @@
-name: vNext backend tests
+name: vNext Phase 1-5 tests
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile vNext backend
         run: |
-          python -m py_compile backend/vnext/*.py backend/vnext_cli.py
+          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py
 
       - name: Phase 1 tests
         run: python backend/test_vnext_phase1.py
@@ -36,3 +36,14 @@ jobs:
 
       - name: Phase 4 tests
         run: python backend/test_vnext_phase4.py
+
+      - name: Phase 5 tests
+        run: python backend/test_vnext_phase5.py
+
+      - name: Phase 5 JavaScript syntax
+        run: |
+          node --check electron/main_vnext.js
+          node --check electron/vnext_ipc.js
+          node --check electron/preload.js
+          node --check renderer/vnext_ui.js
+          node --check renderer/glossary_translate_ui.js
