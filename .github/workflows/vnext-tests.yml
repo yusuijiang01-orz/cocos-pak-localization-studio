@@ -1,4 +1,4 @@
-name: vNext Phase 1-7 tests
+name: vNext Phase 1-8 tests and patch
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile vNext backend
         run: |
-          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py backend/vnext_compat_cli.py backend/vnext_phase7_cli.py
+          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py backend/vnext_compat_cli.py backend/vnext_phase7_cli.py scripts/build_vnext_patch.py
 
       - name: Phase 1 tests
         run: python backend/test_vnext_phase1.py
@@ -95,3 +95,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Electron vNext smoke exited with code $LASTEXITCODE"
           }
+
+  phase8-package:
+    if: github.event_name == 'push'
+    needs: [vnext-tests, phase7-windows-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout validated branch commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build incremental overlay patch
+        env:
+          PATCH_SOURCE_COMMIT: ${{ github.sha }}
+        run: python scripts/build_vnext_patch.py . dist-patch
+
+      - name: Inspect patch contents
+        run: |
+          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip
+          cat dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip.sha256
+
+      - name: Upload incremental patch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cocos-PAK-Studio-vNext-7.0.0-Incremental-Patch
+          path: |
+            dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip
+            dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
