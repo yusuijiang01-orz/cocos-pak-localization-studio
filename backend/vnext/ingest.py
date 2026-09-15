@@ -27,8 +27,8 @@ def ingest_full_xlsx(xlsx_path: Path, project_db_path: Path, *, project_name: st
 
     # A new full snapshot supersedes prior occurrence locations for this project.
     # Units/TM are deliberately retained; only stale source occurrences become inactive.
-    db.execute("UPDATE occurrences SET active=0,updated_at=datetime('now') WHERE project_id=?", (project_id,))
     db.execute("BEGIN")
+    db.execute("UPDATE occurrences SET active=0,updated_at=datetime('now') WHERE project_id=?", (project_id,))
     for row_index, row in enumerate(rows, 2):
         text = str(row.get("text") or "")
         candidate = classify_source(text)
