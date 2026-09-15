@@ -46,7 +46,7 @@ jobs:
       - name: Phase 7 synthetic PACK end-to-end
         run: python backend/test_vnext_phase7.py
 
-      - name: Phase 5-7 JavaScript syntax
+      - name: Phase 5-8 JavaScript syntax
         run: |
           node --check electron/main_vnext.js
           node --check electron/vnext_ipc.js
@@ -65,7 +65,7 @@ jobs:
 
   phase7-windows-smoke:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 18
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,6 +96,24 @@ jobs:
             throw "Electron vNext smoke exited with code $LASTEXITCODE"
           }
 
+      - name: Launch vNext on older baseline without glossary wrappers
+        shell: pwsh
+        run: |
+          Rename-Item .\electron\main_with_glossary_resume.js main_with_glossary_resume.js.bak
+          Rename-Item .\electron\main_with_glossary.js main_with_glossary.js.bak
+          try {
+            $env:STUDIO_VNEXT_SMOKE = '1'
+            $env:ELECTRON_DISABLE_SECURITY_WARNINGS = '1'
+            & .\node_modules\.bin\electron.cmd . --disable-gpu
+            if ($LASTEXITCODE -ne 0) {
+              throw "Electron older-baseline fallback smoke exited with code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Rename-Item .\electron\main_with_glossary_resume.js.bak main_with_glossary_resume.js
+            Rename-Item .\electron\main_with_glossary.js.bak main_with_glossary.js
+          }
+
   phase8-package:
     if: github.event_name == 'push'
     needs: [vnext-tests, phase7-windows-smoke]
@@ -110,23 +128,26 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Build incremental overlay patch
+      - name: Build cumulative runtime overlay patch
         env:
           PATCH_SOURCE_COMMIT: ${{ github.sha }}
         run: python scripts/build_vnext_patch.py . dist-patch
 
       - name: Inspect patch contents
         run: |
-          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip
-          cat dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip.sha256
+          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip
+          cat dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip.sha256
+          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip | grep -q 'electron/main_with_glossary_resume.js'
+          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip | grep -q 'electron/main_with_glossary.js'
+          unzip -l dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip | grep -q 'backend/glossary_xlsx_translate_resumable.py'
 
-      - name: Upload incremental patch artifact
+      - name: Upload cumulative incremental patch artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Cocos-PAK-Studio-vNext-7.0.0-Incremental-Patch
+          name: Cocos-PAK-Studio-vNext-7.0.1-Cumulative-Incremental-Patch
           path: |
-            dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip
-            dist-patch/Cocos-PAK-Studio-vNext-7.0.0-vnext-Incremental-Patch.zip.sha256
+            dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip
+            dist-patch/Cocos-PAK-Studio-vNext-7.0.1-vnext-Incremental-Patch.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
