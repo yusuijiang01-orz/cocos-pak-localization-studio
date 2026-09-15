@@ -281,6 +281,18 @@ def make_live_updates(preview_ctx, changed_segment_ids: set[str], translated_seg
     return updates
 
 
+def detect_records_path(source_mapping: Path | None, explicit: Path | None) -> Path | None:
+    if explicit and explicit.is_file():
+        return explicit
+    if not source_mapping:
+        return None
+    for parent in source_mapping.resolve().parents:
+        candidate = parent / "localization" / "text_records.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def apply_glossary(source_xlsx: Path, source_mapping: Path | None, glossary_xlsx: Path,
                    glossary_mapping: Path | None, output_xlsx: Path,
                    records_path: Path | None = None) -> dict[str, Any]:
@@ -301,6 +313,7 @@ def apply_glossary(source_xlsx: Path, source_mapping: Path | None, glossary_xlsx
     text_header = find_header(headers, TEXT_HEADER_NAMES, headers[-1] if headers else "text")
     if not text_header:
         raise ValueError("所选导出 XLSX 没有可识别的 text/译文列")
+    records_path = detect_records_path(source_mapping, records_path)
     preview_ctx = _preview_context(mapping, records_path)
     translated_segments: dict[str, str] = {}
     batch_changed_ids: set[str] = set()
