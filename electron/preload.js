@@ -1,4 +1,18 @@
 const { contextBridge, ipcRenderer } = require('electron');
+
+async function guardedVnextBuild(channel, payload) {
+  const status = await ipcRenderer.invoke('vnext-compat-status', payload);
+  if (!status?.ok) return status;
+  if (!status?.report?.synced) {
+    return {
+      ok: false,
+      error: status?.report?.message || '旧版工作区在上次 vNext 同步后已经变化；请先同步或吸收旧版译文。',
+      compatibility: status.report,
+    };
+  }
+  return ipcRenderer.invoke(channel, payload);
+}
+
 contextBridge.exposeInMainWorld('studio', {
   choosePaks: () => ipcRenderer.invoke('choose-paks'),
   chooseWorkspace: () => ipcRenderer.invoke('choose-workspace'),
@@ -64,8 +78,10 @@ contextBridge.exposeInMainWorld('studio', {
   vnextGlossaryDelete: (payload) => ipcRenderer.invoke('vnext-glossary-delete', payload),
   vnextTmSave: (payload) => ipcRenderer.invoke('vnext-tm-save', payload),
   vnextTmDelete: (payload) => ipcRenderer.invoke('vnext-tm-delete', payload),
-  vnextBuildPreflight: (payload) => ipcRenderer.invoke('vnext-build-preflight', payload),
-  vnextBuildPaks: (payload) => ipcRenderer.invoke('vnext-build-paks', payload),
+  vnextCompatStatus: (payload) => ipcRenderer.invoke('vnext-compat-status', payload),
+  vnextAdoptLegacy: (payload) => ipcRenderer.invoke('vnext-adopt-legacy', payload),
+  vnextBuildPreflight: (payload) => guardedVnextBuild('vnext-build-preflight', payload),
+  vnextBuildPaks: (payload) => guardedVnextBuild('vnext-build-paks', payload),
   vnextBuildHistory: (payload) => ipcRenderer.invoke('vnext-build-history', payload),
 
   onProgress: (cb) => ipcRenderer.on('backend-progress', (_e, data) => cb(data))
