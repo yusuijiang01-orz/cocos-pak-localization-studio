@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vnext.classify import classify_source
-from vnext.database import add_occurrence, init_knowledge_db, init_project_db, put_tm, upsert_unit
+from vnext.database import add_occurrence, ensure_project, init_knowledge_db, init_project_db, put_tm, upsert_unit
 from vnext.knowledge import GlossaryIndex
 from vnext.pipeline import run_pipeline
 
@@ -34,10 +34,12 @@ class FakeTranslator:
 
 
 def seed_unit(project_db, text: str, record_id="r1"):
+    project_id = ensure_project(project_db, "phase2-test")
     candidate = classify_source(text)
     upsert_unit(project_db, candidate)
     add_occurrence(
         project_db,
+        project_id=project_id,
         unit_id=candidate.unit_id,
         record_id=record_id,
         pak_name="ui.pak",
@@ -68,6 +70,7 @@ class VNextPhase2Tests(unittest.TestCase):
                 quality="manual",
                 locked=True,
             )
+            knowledge.commit()
             knowledge.close()
 
             engine = FakeTranslator({"Băng Hỏa Long Châu": "错误模型译文"})
