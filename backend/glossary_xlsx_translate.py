@@ -3,13 +3,13 @@
 """Apply a translated term glossary workbook to an exported localization XLSX.
 
 The workflow is deterministic/offline and deliberately reuses Studio's own
-lightweight XLSX reader/writer.  Translation matching uses an Aho-Corasick
+lightweight XLSX reader/writer. Translation matching uses an Aho-Corasick
 literal matcher, so runtime is close to O(total text length + matches) instead
 of O(workbook rows * glossary terms).
 
 For multi-PAK v7 exports the script can also read text_records.json and emit
-live record updates while processing.  The Electron UI consumes those events so
-language/status counters visibly change during glossary translation.  Only
+live record updates while processing. The Electron UI consumes those events so
+language/status counters visibly change during glossary translation. Only
 segments that become safe Chinese-only text are written to the translated XLSX;
 partial Chinese/Vietnamese substitutions are reported but not imported.
 """
@@ -62,7 +62,7 @@ def safe_chinese_segment(value: str) -> bool:
     return bool(value and contains_cjk(value) and not LATIN_RE.search(value))
 
 
-def load_json(path: Path | None) -> dict[str, Any]:
+def load_json(path: Path | None) -> Any:
     if not path or not str(path) or not Path(path).is_file():
         return {}
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -98,19 +98,13 @@ def load_glossary(glossary_xlsx: Path, glossary_mapping: Path | None) -> tuple[d
     headers = workbook_headers(rows, mapping, ["text"])
     source_header = find_header(headers, SOURCE_HEADER_NAMES, headers[0] if headers else "text")
     target_header = find_header(headers, TARGET_HEADER_NAMES)
-
     pairs: dict[str, str] = {}
-    # Explicit two-column glossary.  This form is authoritative when present.
     if source_header and target_header and source_header != target_header:
         for row in rows:
             source = text_value(row.get(source_header, ""))
             target = text_value(row.get(target_header, ""))
             if source and target and norm_key(source) != norm_key(target) and contains_cjk(target):
                 pairs[source] = target
-
-    # Current Studio glossary export is one editable column.  Its config mapping
-    # preserves the original term for each row, so translated cell + mapping is
-    # enough to recover source -> Chinese pairs without openpyxl.
     if mapping.get("mode") == "multi-pak-safe-term-glossary":
         mapped = mapping_rows(mapping)
         text_header = find_header(headers, TEXT_HEADER_NAMES, headers[-1] if headers else "text")
@@ -122,8 +116,6 @@ def load_glossary(glossary_xlsx: Path, glossary_mapping: Path | None) -> tuple[d
             target = text_value(row.get(text_header or "text", ""))
             if source and target and norm_key(source) != norm_key(target) and contains_cjk(target):
                 pairs.setdefault(source, target)
-
-    # Also accept a one-column "source=target" form.
     if not pairs and source_header:
         for row in rows:
             raw = text_value(row.get(source_header, ""))
@@ -132,7 +124,6 @@ def load_glossary(glossary_xlsx: Path, glossary_mapping: Path | None) -> tuple[d
                 source, target = text_value(parts[0]), text_value(parts[1])
                 if source and target and norm_key(source) != norm_key(target) and contains_cjk(target):
                     pairs[source] = target
-
     deduped: dict[str, str] = {}
     seen: set[str] = set()
     for source, target in sorted(pairs.items(), key=lambda item: len(item[0]), reverse=True):
@@ -141,16 +132,10 @@ def load_glossary(glossary_xlsx: Path, glossary_mapping: Path | None) -> tuple[d
             continue
         seen.add(key)
         deduped[source] = target
-    return deduped, {
-        "glossary_rows": len(rows),
-        "glossary_terms": len(deduped),
-        "glossary_mapping": str(glossary_mapping or ""),
-    }
+    return deduped, {"glossary_rows": len(rows), "glossary_terms": len(deduped), "glossary_mapping": str(glossary_mapping or "")}
 
 
 class LiteralMatcher:
-    """Dependency-free Aho-Corasick matcher for case-insensitive literal terms."""
-
     def __init__(self, pairs: dict[str, str]):
         self.next: list[dict[str, int]] = [{}]
         self.fail: list[int] = [0]
@@ -171,9 +156,7 @@ class LiteralMatcher:
                     self.out.append([])
                 state = nxt
             self.out[state].append((len(key), source, target))
-        queue: deque[int] = deque()
-        for nxt in self.next[0].values():
-            queue.append(nxt)
+        queue: deque[int] = deque(self.next[0].values())
         while queue:
             state = queue.popleft()
             for ch, nxt in self.next[state].items():
@@ -191,7 +174,6 @@ class LiteralMatcher:
         exact = self.exact.get(norm_key(current))
         if exact is not None:
             return exact, 1, [current]
-
         folded = unicodedata.normalize("NFC", current).casefold()
         state = 0
         matches: list[tuple[int, int, str, str]] = []
@@ -199,17 +181,12 @@ class LiteralMatcher:
             while state and ch not in self.next[state]:
                 state = self.fail[state]
             state = self.next[state].get(ch, 0)
-            if not self.out[state]:
-                continue
             for length, source, target in self.out[state]:
                 start = end - length + 1
                 if start >= 0:
                     matches.append((start, end + 1, source, target))
         if not matches:
             return current, 0, []
-
-        # Leftmost-longest resolution keeps long glossary phrases authoritative
-        # over shorter words contained inside them.
         matches.sort(key=lambda m: (m[0], -(m[1] - m[0])))
         chosen: list[tuple[int, int, str, str]] = []
         cursor = 0
@@ -218,9 +195,6 @@ class LiteralMatcher:
                 continue
             chosen.append(match)
             cursor = match[1]
-        if not chosen:
-            return current, 0, []
-
         out: list[str] = []
         cursor = 0
         applied: list[str] = []
@@ -234,7 +208,7 @@ class LiteralMatcher:
 
 
 def _preview_context(mapping: dict[str, Any], records_path: Path | None):
-    if mapping.get("mode") != "multi-pak-out-of-band-skeleton" or Number(mapping.get("version") or 0) != 7:
+    if mapping.get("mode") != "multi-pak-out-of-band-skeleton" or int(mapping.get("version") or 0) != 7:
         return None
     if not records_path or not records_path.is_file():
         return None
@@ -247,8 +221,7 @@ def _preview_context(mapping: dict[str, Any], records_path: Path | None):
     for idx, item in enumerate(mapped_records):
         if not isinstance(item, list) or len(item) < 7:
             continue
-        skeleton = item[6] or []
-        for piece in skeleton:
+        for piece in item[6] or []:
             if isinstance(piece, (list, tuple)) and len(piece) >= 3 and piece[0] == "t":
                 segment_to_records.setdefault(str(piece[1]), []).append(idx)
     return current_by_id, mapped_records, segment_to_records
@@ -267,7 +240,6 @@ def _record_preview(item: list[Any], current_by_id: dict[str, dict], translated_
     current_texts = [piece[2] for piece in current_skeleton if piece and piece[0] == "t"]
     source_text_count = sum(1 for piece in skeleton if piece and piece[0] == "t")
     preserve_current = source_literals == current_literals and len(current_texts) == source_text_count
-
     out: list[str] = []
     text_index = 0
     changed = False
@@ -282,11 +254,10 @@ def _record_preview(item: list[Any], current_by_id: dict[str, dict], translated_
             continue
         segment_id = str(piece[1])
         source_segment = str(piece[2])
-        if segment_id in translated_segments:
-            value = translated_segments[segment_id]
-            changed = changed or value != (current_texts[text_index] if preserve_current else source_segment)
-        else:
-            value = current_texts[text_index] if preserve_current else source_segment
+        previous = current_texts[text_index] if preserve_current else source_segment
+        value = translated_segments.get(segment_id, previous)
+        if segment_id in translated_segments and value != previous:
+            changed = True
         out.append(value)
         text_index += 1
     target = "".join(out)
@@ -310,33 +281,26 @@ def make_live_updates(preview_ctx, changed_segment_ids: set[str], translated_seg
     return updates
 
 
-def apply_glossary(source_xlsx: Path, source_mapping: Path | None,
-                   glossary_xlsx: Path, glossary_mapping: Path | None,
-                   output_xlsx: Path, records_path: Path | None = None) -> dict[str, Any]:
+def apply_glossary(source_xlsx: Path, source_mapping: Path | None, glossary_xlsx: Path,
+                   glossary_mapping: Path | None, output_xlsx: Path,
+                   records_path: Path | None = None) -> dict[str, Any]:
     if not source_xlsx.is_file():
         raise FileNotFoundError(f"导出 XLSX 不存在：{source_xlsx}")
     if not glossary_xlsx.is_file():
         raise FileNotFoundError(f"术语库 XLSX 不存在：{glossary_xlsx}")
-
     glossary_pairs, glossary_report = load_glossary(glossary_xlsx, glossary_mapping)
     if not glossary_pairs:
         raise ValueError("术语库没有可用的 原文 → 中文 术语对。请确认术语库已翻译，或添加第二列中文译文。")
     matcher = LiteralMatcher(glossary_pairs)
-
     mapping = load_json(source_mapping)
     mapped_rows = mapping_rows(mapping)
-    mapped_by_id = {
-        text_value(row[0]): text_value(row[2] if len(row) > 2 else row[1])
-        for row in mapped_rows
-        if isinstance(row, list) and row
-    }
+    mapped_by_id = {text_value(row[0]): text_value(row[2] if len(row) > 2 else row[1]) for row in mapped_rows if isinstance(row, list) and row}
     rows = read_simple_xlsx(source_xlsx)
     headers = workbook_headers(rows, mapping, ["id", "text"])
     id_header = find_header(headers, ID_HEADER_NAMES, headers[0] if headers else "id")
     text_header = find_header(headers, TEXT_HEADER_NAMES, headers[-1] if headers else "text")
     if not text_header:
         raise ValueError("所选导出 XLSX 没有可识别的 text/译文列")
-
     preview_ctx = _preview_context(mapping, records_path)
     translated_segments: dict[str, str] = {}
     batch_changed_ids: set[str] = set()
@@ -344,7 +308,6 @@ def apply_glossary(source_xlsx: Path, source_mapping: Path | None,
     changed_rows = unchanged_rows = blank_rows = partial_rows = 0
     matched_terms_total = 0
     examples: list[dict[str, Any]] = []
-
     for index, row in enumerate(rows, 1):
         row_id = text_value(row.get(id_header or "id", ""))
         current_text = text_value(row.get(text_header, ""))
@@ -352,7 +315,6 @@ def apply_glossary(source_xlsx: Path, source_mapping: Path | None,
         if not source_text:
             blank_rows += 1
             continue
-
         translated, replacements, applied_terms = matcher.translate(source_text)
         if replacements:
             matched_terms_total += replacements
@@ -369,43 +331,13 @@ def apply_glossary(source_xlsx: Path, source_mapping: Path | None,
                 partial_rows += 1
         else:
             unchanged_rows += 1
-
         if index % 1000 == 0 or index == total_rows:
             updates = make_live_updates(preview_ctx, batch_changed_ids, translated_segments)
             batch_changed_ids.clear()
-            emit({
-                "event": "progress",
-                "phase": "glossary-translate",
-                "percent": min(90, 5 + round(index / max(1, total_rows) * 85, 1)),
-                "message": f"正在应用术语库：{index:,}/{total_rows:,} · 已完成 {changed_rows:,} · 部分命中 {partial_rows:,}",
-                "completed_rows": index,
-                "total_rows": total_rows,
-                "translated_rows": changed_rows,
-                "partial_rows": partial_rows,
-                "updates": updates,
-                "samples": [item["after"] for item in examples[-3:]],
-            })
-
+            emit({"event": "progress", "phase": "glossary-translate", "percent": min(90, 5 + round(index / max(1, total_rows) * 85, 1)), "message": f"正在应用术语库：{index:,}/{total_rows:,} · 已完成 {changed_rows:,} · 部分命中 {partial_rows:,}", "completed_rows": index, "total_rows": total_rows, "translated_rows": changed_rows, "partial_rows": partial_rows, "updates": updates, "samples": [item["after"] for item in examples[-3:]]})
     output_xlsx.parent.mkdir(parents=True, exist_ok=True)
     write_simple_xlsx(output_xlsx, rows, headers=headers, sheet_name="本土化")
-    return {
-        "mode": "glossary-xlsx-translate-fast-v2",
-        "source_xlsx": str(source_xlsx.resolve()),
-        "source_mapping": str(source_mapping or ""),
-        "glossary_xlsx": str(glossary_xlsx.resolve()),
-        "output_xlsx": str(output_xlsx.resolve()),
-        "mapping_mode": mapping.get("mode", ""),
-        "mapping_version": mapping.get("version", ""),
-        "paks": mapping.get("paks") or sorted({item[1] for item in mapping.get("records", []) if isinstance(item, list) and len(item) > 1}),
-        "workbook_rows": total_rows,
-        "translated_rows": changed_rows,
-        "partial_rows": partial_rows,
-        "unchanged_rows": unchanged_rows,
-        "blank_rows": blank_rows,
-        "matched_terms": matched_terms_total,
-        "examples": examples,
-        **glossary_report,
-    }
+    return {"mode": "glossary-xlsx-translate-fast-v2", "source_xlsx": str(source_xlsx.resolve()), "source_mapping": str(source_mapping or ""), "glossary_xlsx": str(glossary_xlsx.resolve()), "output_xlsx": str(output_xlsx.resolve()), "mapping_mode": mapping.get("mode", ""), "mapping_version": mapping.get("version", ""), "paks": mapping.get("paks") or sorted({item[1] for item in mapping.get("records", []) if isinstance(item, list) and len(item) > 1}), "workbook_rows": total_rows, "translated_rows": changed_rows, "partial_rows": partial_rows, "unchanged_rows": unchanged_rows, "blank_rows": blank_rows, "matched_terms": matched_terms_total, "examples": examples, **glossary_report}
 
 
 def main(argv: list[str]) -> int:
