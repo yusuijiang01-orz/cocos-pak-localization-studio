@@ -1,4 +1,4 @@
-name: vNext Phase 1-6 tests
+name: vNext Phase 1-7 tests
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 jobs:
   vnext-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,7 +43,10 @@ jobs:
       - name: Phase 6 tests
         run: python backend/test_vnext_phase6.py
 
-      - name: Phase 5-6 JavaScript syntax
+      - name: Phase 7 synthetic PACK end-to-end
+        run: python backend/test_vnext_phase7.py
+
+      - name: Phase 5-7 JavaScript syntax
         run: |
           node --check electron/main_vnext.js
           node --check electron/vnext_ipc.js
@@ -59,3 +62,36 @@ jobs:
           grep -q 'href="vnext_compat.css"' renderer/index.html
           grep -q 'src="vnext_ui.js"' renderer/index.html
           grep -q 'src="vnext_compat_ui.js"' renderer/index.html
+
+  phase7-windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Phase 7 PACK end-to-end on Windows
+        run: python backend/test_vnext_phase7.py
+
+      - name: Install Electron
+        run: npm install --no-audit --no-fund
+
+      - name: Launch production Electron entry and verify vNext renderer
+        shell: pwsh
+        run: |
+          $env:STUDIO_VNEXT_SMOKE = '1'
+          $env:ELECTRON_DISABLE_SECURITY_WARNINGS = '1'
+          & .\node_modules\.bin\electron.cmd . --disable-gpu
+          if ($LASTEXITCODE -ne 0) {
+            throw "Electron vNext smoke exited with code $LASTEXITCODE"
+          }
