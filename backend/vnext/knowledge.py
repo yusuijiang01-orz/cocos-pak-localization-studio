@@ -100,6 +100,22 @@ def relevant_glossary_terms(
     return matches
 
 
+def terms_hash(terms: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "source": normalize_source(term.get("source", "")),
+            "target": str(term.get("target") or "").strip(),
+            "type": str(term.get("term_type") or ""),
+            "scope": str(term.get("scope") or ""),
+            "priority": int(term.get("priority") or 0),
+            "locked": bool(term.get("locked")),
+        }
+        for term in terms
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def context_hash(context: Any) -> str:
     raw = json.dumps(context or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
