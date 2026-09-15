@@ -112,7 +112,11 @@ def workspace_readiness(
     *,
     knowledge_db_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Check whether a real three-PAK workspace is ready for the Phase-7 build run."""
+    """Check whether a real three-PAK workspace is ready for the Phase-7 build run.
+
+    This function is intentionally read-only: checking readiness must never create a
+    missing project database or silently mark an unsynchronized workspace as valid.
+    """
     workspace = Path(workspace).resolve()
     project_json = workspace / "project.json"
     records = workspace / "localization" / "text_records.json"
@@ -132,7 +136,8 @@ def workspace_readiness(
             problems.append(f"project.json 无法解析：{exc}")
     if not records.is_file():
         problems.append("缺少 localization/text_records.json")
-    if not project_db.is_file():
+    has_project_db = project_db.is_file()
+    if not has_project_db:
         problems.append("缺少 vnext/project.sqlite3；请先同步当前项目")
 
     by_name = {
@@ -170,14 +175,17 @@ def workspace_readiness(
             }
         )
 
-    sync = workspace_sync_status(workspace, project_db) if records.is_file() else {
-        "ok": False, "synced": False, "state": "missing_records", "message": "缺少 text_records.json"
-    }
+    if not records.is_file():
+        sync = {"ok": False, "synced": False, "state": "missing_records", "message": "缺少 text_records.json"}
+    elif not has_project_db:
+        sync = {"ok": True, "synced": False, "state": "never_synced", "message": "vNext 尚未同步当前工作区"}
+    else:
+        sync = workspace_sync_status(workspace, project_db)
     if not sync.get("synced"):
         problems.append(str(sync.get("message") or "vNext 工作区尚未同步"))
 
     preflight = None
-    if project_db.is_file():
+    if has_project_db:
         try:
             preflight = preflight_build(project_db, knowledge_db, require_translated=False, fail_on_warnings=False)
             if not preflight.get("ok"):
@@ -185,6 +193,8 @@ def workspace_readiness(
         except Exception as exc:
             problems.append(f"构建前 QA 无法执行：{exc}")
 
+    # Keep repeated messages out of the machine-readable report.
+    problems = list(dict.fromkeys(problems))
     return {
         "ok": not problems,
         "workspace": str(workspace),
