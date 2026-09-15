@@ -32,11 +32,7 @@ def _project_name(workspace: Path) -> str:
 
 
 def _skeleton_payload(source: str) -> tuple[list[dict[str, str]], list[tuple[int, str]]]:
-    """Return an immutable runtime skeleton and translatable span positions.
-
-    Whitespace-only pieces are treated as protected bytes/text. They are layout, not
-    translation units, and must survive reconstruction exactly.
-    """
+    """Return immutable runtime syntax plus translatable text span positions."""
     skeleton: list[dict[str, str]] = []
     spans: list[tuple[int, str]] = []
     for piece in split_runtime_text(source):
@@ -54,10 +50,10 @@ def ingest_workspace_records(
     *,
     project_name: str = "",
 ) -> dict[str, Any]:
-    """Ingest the live Studio workspace as vNext translation units.
+    """Ingest a Studio workspace without modifying its legacy record cache.
 
-    The legacy record cache remains read-only. Protected syntax is kept out of model
-    units and stored in each occurrence skeleton for deterministic reconstruction.
+    Protected syntax remains outside translation units. Every occurrence stores the same
+    complete skeleton for its record, allowing deterministic reconstruction later.
     """
     workspace = Path(workspace).resolve()
     records_path = workspace / "localization" / "text_records.json"
@@ -97,18 +93,24 @@ def ingest_workspace_records(
                 counts["skipped:no_text_span"] += 1
                 continue
 
-            for text_order, (skeleton_index, span_text) in enumerate(spans):
+            span_rows: list[tuple[int, str, Any]] = []
+            full_skeleton = [dict(item) for item in skeleton]
+            for skeleton_index, span_text in spans:
                 candidate = classify_source(span_text)
                 if candidate.language.value in ("empty", "technical"):
+                    # Preserve the text verbatim if it is not a translation unit.
+                    full_skeleton[skeleton_index] = {"kind": "protected", "value": span_text}
                     counts[f"skipped:{candidate.language.value}"] += 1
                     continue
                 upsert_unit(db, candidate)
-                skeleton_with_units = [dict(item) for item in skeleton]
-                # Resolve every same-source text piece to the same canonical unit id;
-                # other text pieces remain source-only until their own occurrence pass.
-                for item in skeleton_with_units:
-                    if item.get("kind") == "text" and item.get("source") == span_text:
-                        item["unit_id"] = candidate.unit_id
+                full_skeleton[skeleton_index]["unit_id"] = candidate.unit_id
+                span_rows.append((skeleton_index, span_text, candidate))
+
+            if not span_rows:
+                counts["skipped:no_translatable_span"] += 1
+                continue
+
+            for text_order, (skeleton_index, span_text, candidate) in enumerate(span_rows):
                 fp = sha256_text(
                     "\0".join((pak, source_file, record_id, str(skeleton_index), span_text))
                 )
@@ -128,7 +130,7 @@ def ingest_workspace_records(
                         "span_index": skeleton_index,
                         "text_order": text_order,
                     },
-                    skeleton=skeleton_with_units,
+                    skeleton=full_skeleton,
                 )
                 counts["occurrences"] += 1
                 counts[f"language:{candidate.language.value}"] += 1
@@ -139,8 +141,7 @@ def ingest_workspace_records(
             "SELECT COUNT(*) FROM occurrences WHERE project_id=? AND active=1", (pid,)
         ).fetchone()[0]
         units = db.execute(
-            """SELECT COUNT(DISTINCT unit_id) FROM occurrences
-               WHERE project_id=? AND active=1""", (pid,)
+            "SELECT COUNT(DISTINCT unit_id) FROM occurrences WHERE project_id=? AND active=1", (pid,)
         ).fetchone()[0]
         stale = db.execute(
             "SELECT COUNT(*) FROM occurrences WHERE project_id=? AND active=0", (pid,)
