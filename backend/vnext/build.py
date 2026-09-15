@@ -84,7 +84,8 @@ def preflight_build(
                 continue
 
             blocked = project.execute(
-                "SELECT reason FROM blocked_targets WHERE unit_id=? AND target_fingerprint=?",
+                """SELECT note,origin FROM blocked_targets
+                   WHERE unit_id=? AND target_fingerprint=?""",
                 (unit["unit_id"], _target_fingerprint(target_text)),
             ).fetchone()
             if blocked:
@@ -94,7 +95,7 @@ def preflight_build(
                         "code": "HUMAN_BLOCKED_TARGET",
                         "source": unit["source_text"],
                         "target": target_text,
-                        "reason": blocked["reason"],
+                        "reason": blocked["note"] or blocked["origin"] or "人工已拒绝该译文",
                     }
                 )
                 continue
