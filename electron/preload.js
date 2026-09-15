@@ -1,4 +1,18 @@
 const { contextBridge, ipcRenderer } = require('electron');
+
+async function guardedVnextBuild(channel, payload) {
+  const status = await ipcRenderer.invoke('vnext-compat-status', payload);
+  if (!status?.ok) return status;
+  if (!status?.report?.synced) {
+    return {
+      ok: false,
+      error: status?.report?.message || '旧版工作区在上次 vNext 同步后已经变化；请先同步或吸收旧版译文。',
+      compatibility: status.report,
+    };
+  }
+  return ipcRenderer.invoke(channel, payload);
+}
+
 contextBridge.exposeInMainWorld('studio', {
   choosePaks: () => ipcRenderer.invoke('choose-paks'),
   chooseWorkspace: () => ipcRenderer.invoke('choose-workspace'),
@@ -47,5 +61,28 @@ contextBridge.exposeInMainWorld('studio', {
   tmStats: () => ipcRenderer.invoke('tm-stats'),
   modelStatus: () => ipcRenderer.invoke('model-status'),
   modelTranslate: (payload) => ipcRenderer.invoke('model-translate', payload),
+
+  vnextDashboard: (payload) => ipcRenderer.invoke('vnext-dashboard', payload),
+  vnextIngestWorkspace: (payload) => ipcRenderer.invoke('vnext-ingest-workspace', payload),
+  vnextTranslate: (payload) => ipcRenderer.invoke('vnext-translate', payload),
+  vnextStopTranslate: (payload) => ipcRenderer.invoke('vnext-stop-translate', payload),
+  vnextJobStatus: (payload) => ipcRenderer.invoke('vnext-job-status', payload),
+  vnextReviewList: (payload) => ipcRenderer.invoke('vnext-review-list', payload),
+  vnextReviewShow: (payload) => ipcRenderer.invoke('vnext-review-show', payload),
+  vnextReviewApprove: (payload) => ipcRenderer.invoke('vnext-review-approve', payload),
+  vnextReviewReject: (payload) => ipcRenderer.invoke('vnext-review-reject', payload),
+  vnextReviewState: (payload) => ipcRenderer.invoke('vnext-review-state', payload),
+  vnextReviewStats: (payload) => ipcRenderer.invoke('vnext-review-stats', payload),
+  vnextKnowledgeList: (payload) => ipcRenderer.invoke('vnext-knowledge-list', payload),
+  vnextGlossarySave: (payload) => ipcRenderer.invoke('vnext-glossary-save', payload),
+  vnextGlossaryDelete: (payload) => ipcRenderer.invoke('vnext-glossary-delete', payload),
+  vnextTmSave: (payload) => ipcRenderer.invoke('vnext-tm-save', payload),
+  vnextTmDelete: (payload) => ipcRenderer.invoke('vnext-tm-delete', payload),
+  vnextCompatStatus: (payload) => ipcRenderer.invoke('vnext-compat-status', payload),
+  vnextAdoptLegacy: (payload) => ipcRenderer.invoke('vnext-adopt-legacy', payload),
+  vnextBuildPreflight: (payload) => guardedVnextBuild('vnext-build-preflight', payload),
+  vnextBuildPaks: (payload) => guardedVnextBuild('vnext-build-paks', payload),
+  vnextBuildHistory: (payload) => ipcRenderer.invoke('vnext-build-history', payload),
+
   onProgress: (cb) => ipcRenderer.on('backend-progress', (_e, data) => cb(data))
 });

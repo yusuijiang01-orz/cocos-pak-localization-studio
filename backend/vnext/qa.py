@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import re
+from collections import Counter
+from typing import Any
+
+from localization_tm import validate_tokens
+from .classify import detect_language
+from .models import QAResult, QASeverity, SourceLanguage
+from .normalize import normalize_source, normalized_lookup_key
+
+
+HAN_RE = re.compile(r"[\u3400-\u9fff]")
+VI_RE = re.compile(
+    r"[ăâđêôơưĂÂĐÊÔƠƯ"
+    r"àảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíị"
+    r"òỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ"
+    r"ÀẢÃÁẠẰẲẴẮẶẦẨẪẤẬÈẺẼÉẸỀỂỄẾỆÌỈĨÍỊ"
+    r"ÒỎÕÓỌỒỔỖỐỘỜỞỠỚỢÙỦŨÚỤỪỬỮỨỰỲỶỸÝỴ]"
+)
+LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'-]{2,}\b")
+SPACED_HAN_RE = re.compile(r"(?:[\u3400-\u9fff]\s+){3,}[\u3400-\u9fff]")
+REPLACEMENT_RE = re.compile(r"\ufffd|ï¿½|Ã.|Â.|Æ.|á»|áº")
+NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])[+-]?\d+(?:[.,:]\d+)*(?:%?)(?![A-Za-z0-9_])")
+REPEATED_PUNCT_RE = re.compile(r"([!?！？。,.，；;:：])\1{2,}")
+ALLOWED_LATIN = {"NPC", "PK", "PVP", "PVE", "VIP", "HP", "MP", "EXP", "ID", "UI", "URL", "GM", "FPS"}
+
+
+def _residual_latin_words(text: str) -> list[str]:
+    return [word for word in LATIN_WORD_RE.findall(text) if word.upper() not in ALLOWED_LATIN]
+
+
+def _numbers(text: str) -> list[str]:
+    return NUMBER_RE.findall(str(text or ""))
+
+
+def _visible_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def evaluate_glossary_compliance(
+    source: str,
+    target: str,
+    required_terms: list[dict[str, Any]] | None,
+) -> list[QAResult]:
+    if not required_terms:
+        return []
+    source_key = normalized_lookup_key(source)
+    missing: list[dict[str, str]] = []
+    for term in required_terms:
+        src = str(term.get("source") or "").strip()
+        dst = str(term.get("target") or "").strip()
+        if not src or not dst:
+            continue
+        if normalized_lookup_key(src) not in source_key:
+            continue
+        if dst not in target:
+            missing.append({"source": src, "target": dst})
+    if not missing:
+        return []
+    return [
+        QAResult(
+            "GLOSSARY_TERM_MISMATCH",
+            QASeverity.ERROR,
+            "译文没有采用已确认/锁定术语",
+            {"missing_terms": missing[:20]},
+        )
+    ]
+
+
+def evaluate_translation(
+    source: str,
+    target: str,
+    *,
+    required_terms: list[dict[str, Any]] | None = None,
+) -> list[QAResult]:
+    findings: list[QAResult] = []
+    src = str(source or "")
+    tgt = str(target or "")
+    if not normalize_source(tgt):
+        findings.append(QAResult("EMPTY_TARGET", QASeverity.ERROR, "译文为空"))
+        return findings
+
+    ok, source_tokens, target_tokens = validate_tokens(src, tgt)
+    if not ok:
+        findings.append(
+            QAResult(
+                "PROTECTED_TOKEN_MISMATCH",
+                QASeverity.FATAL,
+                "占位符、标签、路径或控制标记与原文不一致",
+                {"source_tokens": source_tokens, "target_tokens": target_tokens},
+            )
+        )
+
+    if REPLACEMENT_RE.search(tgt):
+        findings.append(QAResult("ENCODING_REPLACEMENT_CHAR", QASeverity.FATAL, "译文包含疑似乱码字符"))
+
+    source_numbers = _numbers(src)
+    target_numbers = _numbers(tgt)
+    if source_numbers != target_numbers:
+        findings.append(
+            QAResult(
+                "NUMBER_MISMATCH",
+                QASeverity.ERROR,
+                "译文中的数字、百分比或数值顺序与原文不一致",
+                {"source_numbers": source_numbers, "target_numbers": target_numbers},
+            )
+        )
+
+    has_han = bool(HAN_RE.search(tgt))
+    residual_vi = bool(VI_RE.search(tgt))
+    residual_latin = _residual_latin_words(tgt)
+    source_language = detect_language(src)
+
+    if source_language in (SourceLanguage.VI, SourceLanguage.MIXED, SourceLanguage.LATIN_OTHER) and not has_han:
+        findings.append(QAResult("NO_CHINESE_TARGET", QASeverity.ERROR, "需要汉化的文本没有生成中文译文"))
+
+    if has_han and residual_vi:
+        findings.append(QAResult("ZH_VI_MIXED", QASeverity.ERROR, "译文仍包含越南语重音字符"))
+    elif has_han and residual_latin:
+        findings.append(
+            QAResult(
+                "ZH_LATIN_MIXED",
+                QASeverity.ERROR,
+                "中文译文仍包含未允许的拉丁词",
+                {"words": residual_latin[:20]},
+            )
+        )
+
+    if SPACED_HAN_RE.search(tgt):
+        findings.append(QAResult("WORD_BY_WORD_SPACED_HAN", QASeverity.ERROR, "疑似逐词替换产生的单字空格中文"))
+
+    if normalize_source(src) == normalize_source(tgt):
+        findings.append(QAResult("UNCHANGED_TARGET", QASeverity.WARNING, "译文与原文相同"))
+
+    source_len = _visible_length(src)
+    target_len = _visible_length(tgt)
+    if source_len >= 12 and target_len:
+        ratio = target_len / source_len
+        if ratio < 0.12 or ratio > 4.5:
+            findings.append(
+                QAResult(
+                    "EXTREME_LENGTH_RATIO",
+                    QASeverity.WARNING,
+                    "译文长度与原文差异异常，建议人工检查是否漏译或模型扩写",
+                    {"source_length": source_len, "target_length": target_len, "ratio": round(ratio, 3)},
+                )
+            )
+
+    if REPEATED_PUNCT_RE.search(tgt):
+        findings.append(QAResult("REPEATED_PUNCTUATION", QASeverity.WARNING, "译文包含异常重复标点"))
+
+    findings.extend(evaluate_glossary_compliance(src, tgt, required_terms))
+    return findings
+
+
+def severity_rank(value: QASeverity | str) -> int:
+    raw = value.value if isinstance(value, QASeverity) else str(value or "")
+    return {"info": 0, "warning": 1, "error": 2, "fatal": 3}.get(raw, 0)
+
+
+def highest_severity(findings: list[QAResult]) -> QASeverity:
+    if not findings:
+        return QASeverity.INFO
+    return max((item.severity for item in findings), key=severity_rank)
+
+
+def finding_codes(findings: list[QAResult]) -> list[str]:
+    return [item.code for item in findings]
+
+
+def is_build_safe(findings: list[QAResult]) -> bool:
+    return not any(item.severity in (QASeverity.ERROR, QASeverity.FATAL) for item in findings)
