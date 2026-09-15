@@ -8,8 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from xlsx_localization import write_simple_xlsx
 from vnext.classify import classify_source
 from vnext.database import init_knowledge_db, init_project_db, put_tm
+from vnext.ingest import ingest_full_xlsx
 from vnext.models import SourceLanguage, UnitKind
 from vnext.normalize import normalize_source, source_key
 from vnext.protection import reconstruct, split_runtime_text
@@ -60,6 +62,26 @@ class VNextPhase1Tests(unittest.TestCase):
             self.assertIn("translation_units", tables); self.assertIn("occurrences", tables)
             self.assertIn("translation_jobs", tables); self.assertIn("qa_findings", tables)
             db.close()
+
+    def test_full_xlsx_reingest_deactivates_stale_occurrences(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            xlsx = root / "full.xlsx"
+            db_path = root / "project.sqlite3"
+            headers = ["id", "pak", "source_file", "text"]
+            write_simple_xlsx(xlsx, [
+                {"id": "a", "pak": "ui.pak", "source_file": "a.ini", "text": "Nhiệm vụ"},
+                {"id": "b", "pak": "ui.pak", "source_file": "b.ini", "text": "Kỹ năng"},
+            ], headers=headers)
+            first = ingest_full_xlsx(xlsx, db_path, project_name="test")
+            self.assertEqual(first["active_occurrences"], 2)
+
+            write_simple_xlsx(xlsx, [
+                {"id": "a", "pak": "ui.pak", "source_file": "a.ini", "text": "Nhiệm vụ"},
+            ], headers=headers)
+            second = ingest_full_xlsx(xlsx, db_path, project_name="test")
+            self.assertEqual(second["active_occurrences"], 1)
+            self.assertEqual(second["stale_occurrences"], 1)
 
 
 if __name__ == "__main__":
