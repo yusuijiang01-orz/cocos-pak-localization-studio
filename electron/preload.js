@@ -47,5 +47,26 @@ contextBridge.exposeInMainWorld('studio', {
   tmStats: () => ipcRenderer.invoke('tm-stats'),
   modelStatus: () => ipcRenderer.invoke('model-status'),
   modelTranslate: (payload) => ipcRenderer.invoke('model-translate', payload),
+
+  vnextDashboard: (payload) => ipcRenderer.invoke('vnext-dashboard', payload),
+  vnextIngestWorkspace: (payload) => ipcRenderer.invoke('vnext-ingest-workspace', payload),
+  vnextTranslate: (payload) => ipcRenderer.invoke('vnext-translate', payload),
+  vnextStopTranslate: (payload) => ipcRenderer.invoke('vnext-stop-translate', payload),
+  vnextJobStatus: (payload) => ipcRenderer.invoke('vnext-job-status', payload),
+  vnextReviewList: (payload) => ipcRenderer.invoke('vnext-review-list', payload),
+  vnextReviewShow: (payload) => ipcRenderer.invoke('vnext-review-show', payload),
+  vnextReviewApprove: (payload) => ipcRenderer.invoke('vnext-review-approve', payload),
+  vnextReviewReject: (payload) => ipcRenderer.invoke('vnext-review-reject', payload),
+  vnextReviewState: (payload) => ipcRenderer.invoke('vnext-review-state', payload),
+  vnextReviewStats: (payload) => ipcRenderer.invoke('vnext-review-stats', payload),
+  vnextKnowledgeList: (payload) => ipcRenderer.invoke('vnext-knowledge-list', payload),
+  vnextGlossarySave: (payload) => ipcRenderer.invoke('vnext-glossary-save', payload),
+  vnextGlossaryDelete: (payload) => ipcRenderer.invoke('vnext-glossary-delete', payload),
+  vnextTmSave: (payload) => ipcRenderer.invoke('vnext-tm-save', payload),
+  vnextTmDelete: (payload) => ipcRenderer.invoke('vnext-tm-delete', payload),
+  vnextBuildPreflight: (payload) => ipcRenderer.invoke('vnext-build-preflight', payload),
+  vnextBuildPaks: (payload) => ipcRenderer.invoke('vnext-build-paks', payload),
+  vnextBuildHistory: (payload) => ipcRenderer.invoke('vnext-build-history', payload),
+
   onProgress: (cb) => ipcRenderer.on('backend-progress', (_e, data) => cb(data))
 });
