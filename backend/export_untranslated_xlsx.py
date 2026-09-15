@@ -32,7 +32,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 from tsv_localization import token_template
-from localization_analyzer import active_vi_words
+from localization_analyzer import active_vi_words, is_structural_translation_payload
 
 VI_CHARS_RE = re.compile(r"[ăâđêôơưĂÂĐÊÔƠƯàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩíịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳỷỹýỵÀẢÃÁẠẰẲẴẮẶẦẨẪẤẬÈẺẼÉẸỀỂỄẾỆÌỈĨÍỊÒỎÕÓỌỒỔỖỐỘỜỞỠỚỢÙỦŨÚỤỪỬỮỨỰỲỶỸÝỴ]")
 CODE_IDENTIFIER_RE = re.compile(r"^\[?[A-Za-z_][A-Za-z0-9_.:\-]*\]?$")
@@ -196,6 +196,8 @@ def should_include(r: dict) -> bool:
     source = str(r.get("source_original", "") or "")
     if not current.strip():
         return False
+    if is_structural_translation_payload(current):
+        return False
     transport_marker = re.compile(r"◈\s*(?:P\s*)?\d+\s*◈|《\s*(?:P\s*)?\d+\s*》", re.I)
     if source and transport_marker.search(current) and not transport_marker.search(source):
         return True
@@ -224,8 +226,9 @@ def export_pak(records: Iterable[dict], workspace: Path, pak: str) -> dict:
             continue
         sf = str(r.get("source_file", ""))
         row = r.get("line", 0)
-        if Path(sf).suffix.lower() == ".tsv" and int(row or 0) == 1:
-            continue
+        # The structure-aware extractor already excludes schema headers.  Do
+        # not blanket-drop line 1 here: headerless/synthetic TSV resources can
+        # legitimately contain visible text on their first line.
         current = str(r.get("original", ""))
         source_original = str(r.get("source_original", "") or "")
         # A mixed/partial Google result is poor translation input: models tend

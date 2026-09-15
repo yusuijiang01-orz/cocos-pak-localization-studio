@@ -39,6 +39,20 @@ def test_text_bearing_relative_resource_path_is_fully_protected():
     assert result == [{'id': '1', 'text': r'装备外观：spr\item\equip\Đặc_biệt12.spr，点击查看'}]
 
 
+def test_translategemma_xml_markers_restore_every_immutable_token():
+    source = '$Hoàn thành <c=g>nhiệm vụ %s<c>, nhận {0} phần thưởng.\n'
+    requests, layouts = split_rows(
+        [{'id': '1', 'text': source}], compact=True, marker_style='xml')
+    masked = requests[0]['text']
+    markers = list(layouts['1']['markers'])
+    assert markers
+    assert all(marker.startswith('<x9') and marker.endswith('/>') for marker in markers)
+    translated = masked.replace('Hoàn thành ', '完成').replace('nhiệm vụ ', '任务').replace(
+        ', nhận ', '，获得').replace(' phần thưởng.', '奖励。')
+    assert assemble(layouts, [{'id': 's0', 'text': translated}]) == [
+        {'id': '1', 'text': '$完成<c=g>任务%s<c>，获得{0}奖励。\n'}]
+
+
 def test_chinese_named_resource_path_is_a_validation_token():
     from localization_tm import validate_tokens
     source = r'使用 \spr\item\equip\特殊12.spr'

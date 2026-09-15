@@ -55,6 +55,9 @@ PROTECTED_PATTERNS = [
     # 12) 常量宏（全大写+下划线，必须 ≥4 字符，以避免把 URL / OK / HP / MP / EXP / CD 这种 2-3 字母的"通用缩写词"误抓；
     #     HP/MP/EXP/CD/UID/KEY 已经在前面的 #10 数字+上下文字典式规则里和数字一起被保护了，这里就不抓短宏了。）
     r"\b[A-Z][A-Z0-9_]{3,}\b",
+    # INI runtime value selectors.  They must be captured as one token before
+    # the generic number and single-# fallbacks split ``#d1+`` into pieces.
+    r"#[A-Za-z]\d+[-+]?",
     # 13) 中文/全角括号包裹的"变量候选"整块保护：
     #     【…】〔…〕〖…〗《…》［…］（…）｛…｝<…> […] (…) {…}
     #     只抓以下 4 类"肯定是程序标记不是自然语言"的东西（防止把 (OB) 这种 2-3 字母缩写、《活动》《界面》这种自然文本误抓成占位符）：

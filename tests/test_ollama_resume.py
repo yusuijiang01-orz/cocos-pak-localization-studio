@@ -3,8 +3,40 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 import ollama_batch_translate as obt
+
+
+@pytest.mark.parametrize(('model', 'requested', 'expected_calls'), [
+    ('gemma4:latest', 50, [40]),
+    ('qwen3:14b', 50, [25, 15]),
+])
+def test_model_specific_bucket_cap_is_actually_used(tmp_path, monkeypatch, model, requested, expected_calls):
+    folder = tmp_path / 'untranslated_xlsx' / 'settings'
+    folder.mkdir(parents=True)
+    rows = [{'id': str(i), 'text': f'Xin {i}'} for i in range(40)]
+    obt.overwrite_xlsx(folder / 'settings_localization.xlsx', rows)
+    (folder / 'settings_records_mapping.json').write_text(
+        json.dumps({str(i): [] for i in range(40)}), encoding='utf-8')
+    monkeypatch.setattr(obt, 'load_translator_profile', lambda: {
+        'model': model, 'batchSize': requested,
+    })
+    calls = []
+
+    def fake_chat(messages, **kwargs):
+        batch = json.loads(messages[1]['content'].split('输入：\n')[1].split('\n\n')[0])
+        calls.append(len(batch))
+        if 'gemma' in model:
+            assert kwargs['positional_count'] == len(batch)
+            return json.dumps(['中文' for _row in batch], ensure_ascii=False)
+        return json.dumps([{'id': row['id'], 'text': '中文'} for row in batch], ensure_ascii=False)
+
+    monkeypatch.setattr(obt, 'ollama_chat', fake_chat)
+    report = obt.run(tmp_path, 'settings.pak', bucket_size=requested, resume=False)
+    assert calls == expected_calls
+    assert report['remaining_rows'] == 0
 
 
 def test_dynamic_buckets_limit_rows_and_total_text_size():
@@ -28,6 +60,32 @@ def test_parser_repairs_one_extra_quote_escape_layer():
 def test_parser_accepts_single_object_response():
     reply = '{"id":"s0","text":"任务完成"}'
     assert obt.parse_json_array_block(reply) == [{'id': 's0', 'text': '任务完成'}]
+
+
+def test_positional_parser_restores_ids_by_order_and_rejects_wrong_count():
+    rows = [{'id': 's0'}, {'id': 's1'}]
+    assert obt.parse_positional_array('["任务完成","领取奖励"]', rows) == [
+        {'id': 's0', 'text': '任务完成'}, {'id': 's1', 'text': '领取奖励'},
+    ]
+    with pytest.raises(ValueError, match='数量不匹配'):
+        obt.parse_positional_array('["任务完成"]', rows)
+
+
+def test_translategemma_prompt_and_parser_use_strict_safe_boundaries():
+    rows = [{'id': 's0', 'text': '<x90000000/>Hoàn thành nhiệm vụ.'},
+            {'id': 's1', 'text': 'Nhận thưởng'}]
+    messages = obt.build_translategemma_prompt(rows)
+    assert len(messages) == 1 and messages[0]['role'] == 'user'
+    assert 'ZXQROW000000ZX' in messages[0]['content']
+    assert '<x90000000/>' in messages[0]['content']
+    reply = ('ZXQROW000000ZX <x90000000/>任务完成。 '
+             'ZXQROW000001ZX 领取奖励 ZXQROW000002ZX')
+    assert obt.parse_translategemma_rows(reply, rows) == [
+        {'id': 's0', 'text': '<x90000000/>任务完成。'},
+        {'id': 's1', 'text': '领取奖励'},
+    ]
+    with pytest.raises(ValueError, match='行边界'):
+        obt.parse_translategemma_rows(reply.replace('ZXQROW000001ZX', ''), rows)
 
 
 def test_resume_repacks_holes_and_survives_workbook_overwrite(tmp_path, monkeypatch):

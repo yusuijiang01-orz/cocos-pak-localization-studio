@@ -46,23 +46,110 @@ from xml.etree import ElementTree as ET
 
 import import_untranslated_xlsx as iux  # 共享 XLSX 读和校验逻辑
 import export_untranslated_xlsx as eux  # 共享 XLSX 写（write_xlsx）
-from tsv_localization import restore_template
+from tsv_localization import restore_template, token_template
+from localization_analyzer import score_text
 from protected_segments import NATURAL_LATIN_RE, split_rows, assemble
+from xlsx_localization import read_simple_xlsx as read_full_xlsx
 
 # ---------- 常量 ----------
 OLLAMA_BASE = "http://127.0.0.1:11435"
 DEFAULT_BUCKET_SIZE = 25
-DEFAULT_BUCKET_CHAR_LIMIT = 1800
+DEFAULT_BUCKET_CHAR_LIMIT = 3000
 RETRY_BUCKET_SIZE = 5
 RETRY_BUCKET_CHAR_LIMIT = 1200
 TEMPERATURE = 0.1
+TRANSLATEGEMMA_TERMS = (
+    'Máy chủ=服务器; Nhiệm vụ=任务; Đẳng cấp=等级; Cấp=等级; Kinh nghiệm=经验; '
+    'Trang bị=装备; Kỹ năng=技能; Môn phái=门派; Vũ khí=武器; Vật phẩm=物品; '
+    'Tấn công=攻击; Phòng thủ=防御; Phòng ngự=防御; Sinh lực=生命; '
+    'Lực chiến=战力; Bang hội=帮会; Đội ngũ=队伍; Danh vọng=声望.'
+)
+TRANSLATEGEMMA_PROFILE_PROMPT = """你是《封神/仙侠/武侠 MMORPG》越南语到简体中文的专业本地化翻译员。
+
+翻译要求：
+1. 完整翻译所有越南语自然语言，译文符合中国大陆玩家习惯，不得残留越南语或中越混合片段。
+2. 人名、地名、技能名、装备名应使用自然的中文意译或音译；UI按钮简短，剧情对白自然。
+3. 严格采用术语：Máy chủ=服务器；Nhiệm vụ=任务；Đẳng cấp/Cấp=等级；Kinh nghiệm=经验；Trang bị=装备；Kỹ năng=技能；Môn phái=门派；Vũ khí=武器；Vật phẩm=物品；Tấn công=攻击；Phòng thủ/Phòng ngự=防御；Sinh lực=生命；Lực chiến=战力；Bang hội=帮会；Đội ngũ=队伍；Danh vọng=声望。
+4. ZXQROW加六位数字再加ZX是不可翻译、不可删除、不可移动的行边界，必须逐个原样输出且顺序一致。
+5. <x数字/> 是程序保护的不可翻译占位符，代表原文中的控制符、颜色标签、变量、路径、文件名、换行或特殊标记。每个占位符必须原样输出一次，严禁翻译、改名、删除、复制、合并或调换顺序。
+6. 只翻译行边界之间的自然语言，不添加解释、注释、Markdown、序号或额外内容。
+7. 无法安全处理的内容也不得猜测修改保护标记；程序会负责拒收和缩小批次重试。"""
 CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "cocos-pak-localization-studio" / "api-translator-config.json"
+
+
+def multi_pak_live_index(mapping: dict) -> dict[str, dict[str, list]]:
+    """Index a v7 mapping once so bucket updates do not scan every record."""
+    index: dict[str, dict[str, list]] = {}
+    for item in mapping.get("records", []):
+        if not isinstance(item, list) or len(item) < 7:
+            continue
+        record_id = str(item[0] or "")
+        skeleton = item[6]
+        if not record_id or not isinstance(skeleton, list):
+            continue
+        for piece in skeleton:
+            if isinstance(piece, list) and len(piece) >= 3 and piece[0] == "t":
+                index.setdefault(str(piece[1]), {})[record_id] = item
+    return index
+
+
+def multi_pak_live_updates(mapping: dict, xlsx_ids, values: dict[str, str],
+                           records_by_id: dict[str, dict] | None = None,
+                           segment_index: dict[str, dict[str, list]] | None = None) -> list[dict]:
+    """Return safe, progressively rebuilt Studio texts for a v7 multi-PAK XLSX.
+
+    A v7 workbook deliberately keeps runtime tags, placeholders and literals out
+    of the XLSX.  Its mapping stores those pieces in an exact skeleton instead.
+    During an Ollama run we must rebuild that skeleton before sending an update
+    to the renderer; emitting the raw segment alone makes the sidebar counters
+    unable to identify the affected Studio record.  Unfinished segments retain
+    their canonical source text.  This is display-only and never writes a PAK
+    resource or ``text_records.json``.
+    """
+    records_by_id = records_by_id or {}
+    wanted = {str(value) for value in xlsx_ids}
+    if not wanted:
+        return []
+
+    segment_index = segment_index if segment_index is not None else multi_pak_live_index(mapping)
+    affected: dict[str, list] = {}
+    for segment_id in wanted:
+        affected.update(segment_index.get(segment_id, {}))
+
+    updates = []
+    for record_id, item in affected.items():
+        record = records_by_id.get(record_id)
+        if record is not None and record.get("_isPlayerVisible", True) is not True:
+            continue
+        output = []
+        valid = True
+        for piece in item[6]:
+            if not isinstance(piece, list) or len(piece) < 2:
+                valid = False
+                break
+            if piece[0] in ("p", "k"):
+                output.append(str(piece[1]))
+            elif piece[0] == "t" and len(piece) >= 3:
+                segment_id, segment_source = str(piece[1]), str(piece[2])
+                # A missing / rejected model response is never rendered as an
+                # empty string.  Keep the source span until a valid result is
+                # available, preserving the record's runtime structure exactly.
+                output.append(str(values.get(segment_id) or segment_source))
+            else:
+                valid = False
+                break
+        if valid:
+            updates.append({"id": record_id, "text": "".join(output)})
+    return updates
+
 
 # ---------- Ollama 调用 ----------
 def ollama_chat(messages: list[dict], model: str, base: str = OLLAMA_BASE,
                temperature: float = TEMPERATURE, timeout: int = 600,
                on_delta=None, think: bool = False,
-               response_ids: list[str] | None = None) -> str:
+               response_ids: list[str] | None = None,
+               positional_count: int | None = None,
+               raw_format: bool = False) -> str:
     """Call Ollama's native chat API.
 
     The OpenAI-compatible endpoint does not consistently honor Qwen's
@@ -70,8 +157,15 @@ def ollama_chat(messages: list[dict], model: str, base: str = OLLAMA_BASE,
     so batch translation defaults to disabling reasoning at the server.
     """
     url = base.rstrip("/") + "/api/chat"
-    response_format: str | dict = "json"
-    if response_ids:
+    response_format: str | dict | None = None if raw_format else "json"
+    if not raw_format and positional_count is not None:
+        response_format = {
+            "type": "array",
+            "minItems": positional_count,
+            "maxItems": positional_count,
+            "items": {"type": "string"},
+        }
+    elif not raw_format and response_ids:
         response_format = {
             "type": "array",
             "minItems": len(response_ids),
@@ -91,9 +185,10 @@ def ollama_chat(messages: list[dict], model: str, base: str = OLLAMA_BASE,
         "messages": messages,
         "stream": bool(on_delta),
         "think": bool(think),
-        "format": response_format,
         "options": {"temperature": temperature},
     }
+    if response_format is not None:
+        payload["format"] = response_format
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -186,6 +281,75 @@ def build_bucket_prompt(system_prompt: str, rows: list[dict]) -> list[dict]:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
     ]
+
+
+def build_positional_bucket_prompt(system_prompt: str, rows: list[dict]) -> list[dict]:
+    """Faster Gemma prompt: array position replaces repeated JSON id fields."""
+    source = [str(row.get("text", "")) for row in rows]
+    user_text = (
+        "/no_think\n把输入数组逐项从越南语翻译成简体中文。只返回 JSON 字符串数组；"
+        f"输出必须恰好 {len(source)} 项，顺序与输入完全一致。"
+        "◈N◈、$#= 前缀、颜色标签、路径、变量和代码必须原样保留；"
+        "自然语言不得残留越南语。不要解释，不要 Markdown。\n\n输入：\n"
+        + json.dumps(source, ensure_ascii=False)
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def parse_positional_array(text: str, rows: list[dict]) -> list[dict]:
+    values = json.loads(text.strip(), strict=False)
+    if not isinstance(values, list) or len(values) != len(rows):
+        actual = len(values) if isinstance(values, list) else "非数组"
+        raise ValueError(f"位置数组数量不匹配：期望 {len(rows)}，实际 {actual}")
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("位置数组包含空值或非字符串")
+    return [
+        {"id": str(row.get("id", "")), "text": value}
+        for row, value in zip(rows, values)
+    ]
+
+
+def build_translategemma_prompt(rows: list[dict], localization_prompt: str = '') -> list[dict]:
+    """TranslateGemma's documented single-message format plus safe row framing."""
+    framed = []
+    for index, row in enumerate(rows):
+        framed.append(f'ZXQROW{index:06d}ZX {str(row.get("text", ""))}')
+    framed.append(f'ZXQROW{len(rows):06d}ZX')
+    content = (
+        'You are a professional Vietnamese (vi) to Chinese Simplified (zh-Hans) translator. '
+        'Accurately convey the complete meaning using natural Chinese suitable for a wuxia/xianxia MMORPG. '
+        'Produce only the Chinese translation, without explanations or commentary. '
+        'Every token matching ZXQROW followed by six digits and ZX is an immutable row separator. '
+        'Every self-closing tag like <x90000000/> is an immutable placeholder. '
+        'Copy every separator and placeholder exactly once, in exactly the original order. '
+        'Never translate, delete, rename, merge, or move them. Translate only natural language between them. '
+        f'Use this terminology: {TRANSLATEGEMMA_TERMS}\n'
+        'Additional mandatory game-localization requirements:\n'
+        + (localization_prompt.strip() or TRANSLATEGEMMA_PROFILE_PROMPT)
+        + '\n\n'
+        'Please translate the following Vietnamese text into Chinese Simplified:\n\n'
+        + ' '.join(framed)
+    )
+    return [{"role": "user", "content": content}]
+
+
+def parse_translategemma_rows(text: str, rows: list[dict]) -> list[dict]:
+    expected = [f'ZXQROW{index:06d}ZX' for index in range(len(rows) + 1)]
+    found = re.findall(r'ZXQROW\d{6}ZX', text)
+    if found != expected:
+        raise ValueError(f'TranslateGemma 行边界不完整或错位：期望 {len(expected)}，实际 {len(found)}')
+    output = []
+    for index, row in enumerate(rows):
+        start = text.index(expected[index]) + len(expected[index])
+        end = text.index(expected[index + 1], start)
+        value = text[start:end].strip()
+        if not value:
+            raise ValueError(f'TranslateGemma 第 {index + 1} 项为空')
+        output.append({'id': str(row.get('id', '')), 'text': value})
+    return output
 
 
 def parse_json_array_block(text: str) -> list[dict]:
@@ -406,21 +570,58 @@ def make_dynamic_buckets(rows: list[dict], row_limit: int,
     return groups
 
 
+def make_file_ordered_buckets(rows: list[dict], row_limit: int,
+                              char_limit: int = DEFAULT_BUCKET_CHAR_LIMIT) -> tuple[list[list[dict]], list[str]]:
+    """Never mix source files in one request; process files in archive-name order."""
+    by_file: dict[str, list[dict]] = {}
+    for row in rows:
+        by_file.setdefault(str(row.get('_queue_file') or '未分类文本'), []).append(row)
+    file_order = sorted(by_file, key=lambda name: name.lower())
+    buckets = []
+    for name in file_order:
+        buckets.extend(make_dynamic_buckets(by_file[name], row_limit, char_limit))
+    return buckets, file_order
+
+
 # ---------- 主流程 ----------
 def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=None,
-        bucket_size=None, xlsx=None, control_path=None):
+        bucket_size=None, xlsx=None, control_path=None, metadata_dir=None):
     """用 Ollama 批量翻译指定 PAK 的未翻译 XLSX。返回 report dict。
     progress 为可选回调，接收 dict（含 message / percent）。"""
     ws = Path(workspace)
     base = re.sub(r"\.pak$", "", pak, flags=re.I)
     default_xlsx = ws / "untranslated_xlsx" / base / f"{base}_localization.xlsx"
     xlsx_path = Path(xlsx) if xlsx else default_xlsx
+    is_default_xlsx = xlsx_path.resolve() == default_xlsx.resolve()
+    metadata_path = Path(metadata_dir) if metadata_dir is not None else xlsx_path.parent
+    metadata_path.mkdir(parents=True, exist_ok=True)
     # Keep checkpoints tied to the selected workbook, otherwise continuing a
     # custom file could reuse IDs/translations from a different XLSX.
-    ckpt_path = (ws / "untranslated_xlsx" / base / "ollama_checkpoint.json") if xlsx_path.resolve() == default_xlsx.resolve() else xlsx_path.with_name(xlsx_path.stem + ".ollama_checkpoint.json")
-    records_mapping_path = ws / "untranslated_xlsx" / base / f"{base}_records_mapping.json"
+    ckpt_path = (ws / "untranslated_xlsx" / base / "ollama_checkpoint.json") if is_default_xlsx else metadata_path / (xlsx_path.stem + ".ollama_checkpoint.json")
+    custom_records_mapping = metadata_path / f'{xlsx_path.stem}_records_mapping.json'
+    legacy_records_mapping = xlsx_path.with_name(f'{xlsx_path.stem}_records_mapping.json')
+    multi_mapping_path = metadata_path / f'{xlsx_path.stem}_mapping.json'
+    multi_mapping = {}
+    if multi_mapping_path.exists():
+        try:
+            candidate = json.loads(multi_mapping_path.read_text(encoding='utf-8-sig'))
+            if (
+                candidate.get('mode') == 'multi-pak-out-of-band-skeleton' and candidate.get('version') == 7
+            ) or (
+                candidate.get('mode') == 'multi-pak-safe-term-glossary' and candidate.get('version') == 1
+            ):
+                multi_mapping = candidate
+        except (OSError, ValueError, TypeError):
+            multi_mapping = {}
+    glossary_only = multi_mapping.get('mode') == 'multi-pak-safe-term-glossary'
+    if not is_default_xlsx and custom_records_mapping.exists():
+        records_mapping_path = custom_records_mapping
+    elif not is_default_xlsx and legacy_records_mapping.exists():
+        records_mapping_path = legacy_records_mapping
+    else:
+        records_mapping_path = ws / "untranslated_xlsx" / base / f"{base}_records_mapping.json"
     export_report_path = ws / "untranslated_xlsx" / base / "export_report.json"
-    if export_report_path.exists():
+    if is_default_xlsx and export_report_path.exists():
         export_report = json.loads(export_report_path.read_text(encoding="utf-8"))
         if export_report.get("status") == "empty" or int(export_report.get("unique_rows_xlsx") or 0) == 0:
             raise ValueError(export_report.get("message") or "没有可翻译的未翻译文本")
@@ -437,9 +638,12 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         bucket_size = int(configured_bucket_size or DEFAULT_BUCKET_SIZE)
     except (TypeError, ValueError):
         bucket_size = DEFAULT_BUCKET_SIZE
-    # qwen3:14b is stable at 25 rows. Larger buckets can return shifted or
-    # repeated translations even when the item count looks correct.
-    bucket_size = max(1, min(25, bucket_size))
+    # Qwen's older JSON output is safest at 25 rows. Gemma4 handles the user's
+    # configured 50-row batches reliably; the separate character budget still
+    # splits long text automatically, and rejected rows fall back to 5-row
+    # safety retries.
+    model_bucket_cap = 25 if 'qwen' in str(model).lower() else 50
+    bucket_size = max(1, min(model_bucket_cap, bucket_size))
     if ollama_base is None:
         ollama_base = str(profile.get("baseUrl") or OLLAMA_BASE)
         ollama_base = re.sub(r"/v1/?$", "", ollama_base).rstrip("/") or OLLAMA_BASE
@@ -458,6 +662,15 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
     records_mapping = {}
     if records_mapping_path.exists():
         records_mapping = json.loads(records_mapping_path.read_text(encoding="utf-8"))
+    record_files = {}
+    records_by_id = {}
+    records_path = ws / 'localization' / 'text_records.json'
+    if records_path.exists():
+        for record in json.loads(records_path.read_text(encoding='utf-8')):
+            record_id = str(record.get('id', ''))
+            record_files[record_id] = str(record.get('source_file') or '未分类文本')
+            records_by_id[record_id] = record
+    multi_live_index = multi_pak_live_index(multi_mapping) if multi_mapping else {}
 
     def importable(rid, target):
         for entry in records_mapping.get(str(rid), []):
@@ -472,7 +685,13 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
 
     def _live_updates(xlsx_ids, values=None) -> list[dict]:
         """Restore one deduplicated XLSX translation to every Studio record it represents."""
+        if glossary_only:
+            return []
         source_values = translations if values is None else values
+        if multi_mapping:
+            return multi_pak_live_updates(
+                multi_mapping, xlsx_ids, source_values, records_by_id, multi_live_index
+            )
         restored_by_id = {}
         for xid in xlsx_ids:
             translated = source_values.get(str(xid), "")
@@ -495,25 +714,43 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
     _emit(f"[{pak}] 模型：{model}  Ollama：{ollama_base}")
     _emit(f"提示词长度：{len(system_prompt)} chars")
 
-    rows_in = iux.read_simple_xlsx(xlsx_path)
+    rows_in = read_full_xlsx(xlsx_path) if multi_mapping else iux.read_simple_xlsx(xlsx_path)
+    if glossary_only and not any(str(row.get("id", "")).strip() for row in rows_in):
+        mapping_rows = multi_mapping.get("rows") or []
+        if len(mapping_rows) != len(rows_in):
+            raise ValueError(
+                f"术语库 XLSX 与映射行数不一致：XLSX {len(rows_in):,} 行，映射 {len(mapping_rows):,} 行。"
+            )
+        for row, mapped in zip(rows_in, mapping_rows):
+            row["id"] = str(mapped[0]).strip()
     for row in rows_in:
         row["id"] = str(row.get("id", "")).strip()
     duplicate_ids = sorted(rid for rid, count in Counter(row["id"] for row in rows_in if row["id"]).items() if count > 1)
     if duplicate_ids:
         raise ValueError(f"所选 XLSX 存在重复 ID，已阻止可能的错位导入：{duplicate_ids[:10]}")
     selected_ids = {row["id"] for row in rows_in if row["id"]}
-    mapping_ids = {str(x).strip() for x in records_mapping}
-    if selected_ids != mapping_ids:
+    mapping_ids = (
+        {str(row[0]).strip() for row in multi_mapping.get('rows', []) if row}
+        if multi_mapping else
+        {str(x).strip() for x in records_mapping}
+    )
+    sparse_multi_mapping = bool(multi_mapping.get('remaining_only'))
+    mapping_matches = (
+        selected_ids.issubset(mapping_ids)
+        and len(selected_ids) == int(multi_mapping.get('workbook_rows') or 0)
+        if sparse_multi_mapping else selected_ids == mapping_ids
+    )
+    if not mapping_matches:
         missing = sorted(mapping_ids - selected_ids)[:10]
         extra = sorted(selected_ids - mapping_ids)[:10]
         raise ValueError(
-            f"所选 XLSX 与当前 {pak} 映射不匹配：XLSX ID {len(selected_ids):,} 个，映射 ID {len(mapping_ids):,} 个；"
+            f"所选 XLSX 与配套映射不匹配：XLSX ID {len(selected_ids):,} 个，映射 ID {len(mapping_ids):,} 个；"
             f"缺少 {missing}，多出 {extra}。请选取本次‘导出未翻译’产生的 XLSX。"
         )
     # The translated workbook is intentionally overwritten at the end of a run.
     # Reuse its original .bak as the source on resume, otherwise the translated
     # cells change the fingerprint and make a valid checkpoint look stale.
-    backup = xlsx_path.with_name(xlsx_path.name + ".bak")
+    backup = xlsx_path.with_name(xlsx_path.name + ".bak") if is_default_xlsx else metadata_path / (xlsx_path.name + ".bak")
     saved_checkpoint = {}
     restored_from_backup = False
     if resume and ckpt_path.exists():
@@ -523,7 +760,7 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
             saved_checkpoint = {}
     if saved_checkpoint and backup.exists():
         try:
-            backup_rows = iux.read_simple_xlsx(backup)
+            backup_rows = read_full_xlsx(backup) if multi_mapping else iux.read_simple_xlsx(backup)
             for row in backup_rows:
                 row["id"] = str(row.get("id", "")).strip()
             backup_ids = {row["id"] for row in backup_rows if row["id"]}
@@ -578,6 +815,35 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         rid: value for rid, value in translations.items()
         if importable(rid, value) and not natural_residual(value)
     }
+    # Reuse translations already accepted into Studio even when the selected
+    # workbook is an older untranslated copy or comes from another export
+    # folder. This is stronger than checkpoint-only resume and prevents valid
+    # Google/manual/Ollama Chinese from being sent through the model again.
+    reused_from_studio = 0
+    for xlsx_id, entries in records_mapping.items():
+        xlsx_id = str(xlsx_id)
+        if xlsx_id in translations:
+            continue
+        candidates = Counter()
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            record = records_by_id.get(str(entry.get('id', '')))
+            if not record or record.get('_isPlayerVisible', True) is not True:
+                continue
+            current = str(record.get('original') or '')
+            source = str(record.get('source_original', entry.get('source', '')) or entry.get('source', ''))
+            if not current or current == source or score_text(current)[1] != 'zh':
+                continue
+            portable = token_template(current)['text']
+            candidates[portable] += 1
+        if candidates:
+            candidate = candidates.most_common(1)[0][0]
+            if importable(xlsx_id, candidate):
+                translations[xlsx_id] = candidate
+                reused_from_studio += 1
+    if reused_from_studio:
+        _emit(f'[复用] 从 Studio 当前记录直接带入 {reused_from_studio:,} 条合格中文，不再调用 Ollama')
     # Old exports may still contain complete script expressions. Mark them as
     # unchanged/completed and overwrite any earlier model-corrupted checkpoint
     # value so they are never sent to Ollama or shown as a live translation.
@@ -599,13 +865,19 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         and importable(str(row["id"]), str(row.get("text", "")))
     }
     translations.update(already_localized_rows)
+    for row in rows_in:
+        mapped_files = sorted({
+            record_files.get(str(entry.get('id', '')), '')
+            for entry in records_mapping.get(row["id"], []) if isinstance(entry, dict)
+        } - {''})
+        row['_queue_file'] = mapped_files[0] if mapped_files else str(row.get('source_file') or '未分类文本')
     pending_rows = [row for row in rows_in if row["id"] not in translations]
-    pending_buckets = make_dynamic_buckets(pending_rows, bucket_size)
+    pending_buckets, queue_files = make_file_ordered_buckets(pending_rows, bucket_size)
     buckets = len(pending_buckets)
     primary_bucket_count = buckets
     retry_bucket_count = 0
     done.clear()
-    _emit(f"本次续译：已保存 {len(translations):,} 条，脚本跳过 {len(executable_rows):,} 条，已有中文 {len(already_localized_rows):,} 条，待译 {len(pending_rows):,} 条，共 {buckets} 桶（每桶最多 {bucket_size} 条 / 约 {DEFAULT_BUCKET_CHAR_LIMIT} 字）")
+    _emit(f"本次续译：按文件顺序处理 {len(queue_files)} 个文件；已保存/复用 {len(translations):,} 条，待译 {len(pending_rows):,} 条，共 {buckets} 桶（每桶最多 {bucket_size} 条 / 约 {DEFAULT_BUCKET_CHAR_LIMIT} 字）", total_files=len(queue_files), reused_from_studio=reused_from_studio)
 
     started_at = time.time()
     done_count = 0
@@ -631,23 +903,39 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         nonlocal done_count
         expected_ids = {r["id"] for r in rows_subset}
         display_buckets = phase_bucket_count if phase_bucket_count is not None else buckets
+        current_file = str(rows_subset[0].get('_queue_file') or '未分类文本') if rows_subset else '未分类文本'
+        current_file_index = queue_files.index(current_file) + 1 if current_file in queue_files else 0
         failure_key = f"{phase_name}:{b_idx}"
         bucket_t0 = time.time()
-        segment_rows, segment_layouts = split_rows(rows_subset, compact=compact)
-        msgs = build_bucket_prompt(system_prompt, segment_rows)
+        translate_gemma = 'translategemma' in str(model).lower()
+        segment_rows, segment_layouts = split_rows(
+            rows_subset, compact=compact,
+            marker_style='xml' if translate_gemma else 'diamond',
+        )
+        fast_positional = 'gemma' in str(model).lower() and not translate_gemma and bool(segment_rows)
+        if translate_gemma:
+            msgs = build_translategemma_prompt(segment_rows, system_prompt)
+        elif fast_positional:
+            msgs = build_positional_bucket_prompt(system_prompt, segment_rows)
+        else:
+            msgs = build_bucket_prompt(system_prompt, segment_rows)
         if thinking:
             msgs = [{**m, 'content': m['content'].replace('/no_think', '')} for m in msgs]
 
-        def _chat_with_heartbeat(request_messages, label="主请求", response_ids=None):
+        def _chat_with_heartbeat(request_messages, label="主请求", response_ids=None,
+                                 positional_count=None, raw_format=False):
             """Keep Studio visibly alive while Ollama is processing one non-streaming request."""
             request_t0 = time.time()
             base_percent = round((b_idx / max(1, display_buckets)) * 100, 1)
             _emit(
-                f"{phase_name}：正在翻译第 {b_idx + 1}/{display_buckets} 桶（{label}，{len(rows_subset)} 行）",
+                f"文件 {current_file_index}/{len(queue_files)} · {current_file} · 第 {b_idx + 1}/{display_buckets} 桶（{label}，{len(rows_subset)} 行）",
                 percent=base_percent,
                 current_bucket=b_idx + 1,
                 total_buckets=display_buckets,
                 bucket_rows=len(rows_subset),
+                current_file=current_file,
+                current_file_index=current_file_index,
+                total_files=len(queue_files),
             )
             streamed_ids = set()
             streamed_values = {}
@@ -701,6 +989,8 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
                     on_delta=_on_delta,
                     think=thinking,
                     response_ids=response_ids,
+                    positional_count=positional_count,
+                    raw_format=raw_format,
                 )
                 while True:
                     try:
@@ -725,7 +1015,9 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
                 reply = _chat_with_heartbeat(
                     msgs,
                     f"主请求 {attempt}/{api_retry_limit + 1}",
-                    [str(row["id"]) for row in segment_rows],
+                    None if fast_positional else [str(row["id"]) for row in segment_rows],
+                    len(segment_rows) if fast_positional else None,
+                    translate_gemma,
                 )
                 api_ok = True
                 break
@@ -767,7 +1059,13 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
                             continue
                         break
                 try:
-                    parsed_items = parse_json_array_block(sub_reply)
+                    parsed_items = (
+                        parse_translategemma_rows(sub_reply, segment_rows)
+                        if tag == "full" and translate_gemma else
+                        parse_positional_array(sub_reply, segment_rows)
+                        if tag == "full" and fast_positional else
+                        parse_json_array_block(sub_reply)
+                    )
                     sub_arr = assemble(segment_layouts, parsed_items) if tag == "full" else parsed_items
                 except Exception as e:
                     last_parse_err = f"{type(e).__name__}: {e}"
@@ -892,8 +1190,22 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         for source_row in rows_in:
             rid = source_row["id"]
             translated = translations.get(rid, "")
-            current_rows.append({"id": rid, "text": translated if translated.strip() else source_row["text"]})
-        overwrite_xlsx(xlsx_path, current_rows)
+            if glossary_only:
+                row = dict(source_row)
+                row["id"] = rid
+                row["text"] = translated if translated.strip() else source_row["text"]
+                current_rows.append(row)
+            else:
+                current_rows.append({
+                    key: value for key, value in {
+                        "id": rid,
+                        "pak": source_row.get("pak", ""),
+                        "source_file": source_row.get("source_file", ""),
+                        "text": translated if translated.strip() else source_row["text"],
+                    }.items()
+                })
+        headers = multi_mapping.get("headers") if glossary_only else (["id", "pak", "source_file", "text"] if multi_mapping else ["id", "text"])
+        overwrite_xlsx(xlsx_path, current_rows, headers=headers)
 
     def save_checkpoint(total_buckets: int, phase: str) -> None:
         write_json_atomic(ckpt_path, {
@@ -940,7 +1252,7 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
     # small safe buckets and send the full prompt once per group.
     retry_rows = [row for row in pending_rows if row["id"] not in translations]
     if retry_rows and not stop_requested and (not max_buckets or done_count < max_buckets):
-        retry_buckets = make_dynamic_buckets(
+        retry_buckets, _retry_files = make_file_ordered_buckets(
             retry_rows,
             min(RETRY_BUCKET_SIZE, bucket_size),
             RETRY_BUCKET_CHAR_LIMIT,
@@ -994,8 +1306,15 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         "elapsed_seconds": round(elapsed, 1),
         "checkpoint": str(ckpt_path),
         "stopped": stop_requested,
+        "reused_from_studio": reused_from_studio,
+        "glossary_only": glossary_only,
     }
-    (xlsx_path.parent / "translation_report.json").write_text(
+    report_path = (
+        xlsx_path.parent / "translation_report.json"
+        if is_default_xlsx
+        else metadata_path / (xlsx_path.stem + "_translation_report.json")
+    )
+    report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
@@ -1009,6 +1328,142 @@ def run(workspace, pak, max_buckets=0, ollama_base=None, resume=True, progress=N
         first_error = next(iter(failed_buckets.values()))
         raise RuntimeError(f"Ollama 翻译失败：0/{total_rows} 条成功。{first_error}")
     return report
+
+
+def run_folder(workspace, pak, folder, bucket_size=None, control_path=None, progress=None, metadata_dir=None) -> dict:
+    """Translate every per-file workbook in a folder, in filename order."""
+    folder = Path(folder)
+    if metadata_dir is not None:
+        metadata_dir = Path(metadata_dir)
+    else:
+        adjacent_config = folder.parent / 'config'
+        metadata_dir = adjacent_config if adjacent_config.is_dir() else folder
+    workbooks = sorted(
+        path for path in folder.glob('*_localization.xlsx')
+        if not path.name.endswith('.bak')
+    )
+    if not workbooks:
+        raise ValueError(f'文件夹中没有找到 *_localization.xlsx：{folder}')
+    completed_before = []
+    pending_workbooks = []
+    for workbook in workbooks:
+        report_path = metadata_dir / (workbook.stem + '_translation_report.json')
+        complete = False
+        if report_path.exists():
+            try:
+                previous = json.loads(report_path.read_text(encoding='utf-8'))
+                # A later manual/Google edit invalidates the completion marker
+                # and must be processed again. Otherwise a complete report is
+                # authoritative and the workbook never re-enters run().
+                complete = (
+                    previous.get('status') == 'complete'
+                    and int(previous.get('remaining_rows') or 0) == 0
+                    and report_path.stat().st_mtime_ns >= workbook.stat().st_mtime_ns
+                )
+            except (OSError, ValueError, TypeError):
+                complete = False
+        if complete:
+            completed_before.append(workbook)
+        else:
+            pending_workbooks.append(workbook)
+    # File-level priority comes from the current Studio record database, not
+    # from filename guesses. Workbooks whose source files still contain VI or
+    # mixed text run first; Chinese-only workbooks stay behind them and are
+    # normally satisfied by the reuse/skip logic inside run().
+    vietnamese_by_file = Counter()
+    records_path = Path(workspace) / 'localization' / 'text_records.json'
+    if records_path.exists():
+        try:
+            for record in json.loads(records_path.read_text(encoding='utf-8')):
+                if record.get('pak') != pak or record.get('_isPlayerVisible', True) is not True:
+                    continue
+                if score_text(str(record.get('original') or ''))[1] in {'vi', 'mixed'}:
+                    vietnamese_by_file[str(record.get('source_file') or '')] += 1
+        except (OSError, ValueError, TypeError):
+            vietnamese_by_file.clear()
+
+    def source_files_for_workbook(workbook: Path) -> list[str]:
+        mapping_path = metadata_dir / (workbook.stem + '_mapping.json')
+        if mapping_path.exists():
+            try:
+                mapping = json.loads(mapping_path.read_text(encoding='utf-8'))
+                names = [Path(str(value)).name for value in mapping.get('files') or [] if str(value)]
+                if names:
+                    return names
+            except (OSError, ValueError, TypeError):
+                pass
+        suffix = '_localization.xlsx'
+        return [workbook.name[:-len(suffix)]] if workbook.name.endswith(suffix) else [workbook.stem]
+
+    def vietnamese_count(workbook: Path) -> int:
+        return sum(vietnamese_by_file.get(name, 0) for name in source_files_for_workbook(workbook))
+
+    pending_workbooks.sort(key=lambda workbook: (
+        0 if vietnamese_count(workbook) > 0 else 1,
+        workbook.name.lower(),
+    ))
+    prioritized_files = sum(1 for workbook in pending_workbooks if vietnamese_count(workbook) > 0)
+    reports = []
+    failed = []
+    stopped = False
+    completed_count = len(completed_before)
+    workbook_rows = {}
+    for workbook in workbooks:
+        try:
+            workbook_rows[workbook] = max(1, len(iux.read_simple_xlsx(workbook)))
+        except Exception:
+            workbook_rows[workbook] = 1
+    total_queue_rows = sum(workbook_rows.values())
+    completed_queue_rows = sum(workbook_rows[workbook] for workbook in completed_before)
+    if progress:
+        next_name = pending_workbooks[0].name if pending_workbooks else '无'
+        progress({
+            'percent': round(completed_queue_rows * 100 / max(1, total_queue_rows), 1),
+            'message': f'续跑检查完成：已完成并跳过 {completed_count}/{len(workbooks)}；越南文优先队列 {prioritized_files} 个；下一个：{next_name}',
+            'current_file': next_name,
+            'current_file_index': completed_count + 1 if pending_workbooks else len(workbooks),
+            'total_files': len(workbooks),
+            'completed_files': completed_count,
+            'skipped_completed_files': completed_count,
+            'prioritized_vietnamese_files': prioritized_files,
+            'completed_rows': completed_queue_rows,
+            'total_rows': total_queue_rows,
+        })
+    processed_queue_rows = completed_queue_rows
+    for pending_index, workbook in enumerate(pending_workbooks, 1):
+        index = completed_count + pending_index
+        if progress:
+            priority_label = '越南文优先' if vietnamese_count(workbook) > 0 else '复用/复查'
+            progress({'percent': round(processed_queue_rows * 100 / max(1, total_queue_rows), 1), 'message': f'{priority_label} {index}/{len(workbooks)}：{workbook.name}（已完成 {completed_count}）', 'current_file': workbook.name, 'current_file_index': index, 'total_files': len(workbooks), 'completed_files': completed_count, 'skipped_completed_files': len(completed_before), 'prioritized_vietnamese_files': prioritized_files, 'completed_rows': processed_queue_rows, 'total_rows': total_queue_rows})
+        try:
+            def forward_file_progress(item, i=index, name=workbook.name, base_rows=processed_queue_rows, file_rows=workbook_rows[workbook]):
+                if not progress:
+                    return
+                try:
+                    file_percent = max(0.0, min(100.0, float(item.get('percent') or 0)))
+                except (TypeError, ValueError):
+                    file_percent = 0.0
+                global_rows = base_rows + file_rows * file_percent / 100
+                progress({**item, 'file_percent': file_percent, 'percent': round(global_rows * 100 / max(1, total_queue_rows), 2), 'message': f'文件 {i}/{len(workbooks)} · {name} · {item.get("message", "")}', 'current_file': name, 'current_file_index': i, 'total_files': len(workbooks), 'completed_rows': round(global_rows), 'total_rows': total_queue_rows})
+
+            report = run(workspace, pak, resume=True, progress=forward_file_progress if progress else None, bucket_size=bucket_size, xlsx=workbook, control_path=control_path, metadata_dir=metadata_dir)
+            reports.append(report)
+            if report.get('status') == 'complete' and not report.get('stopped'):
+                completed_count += 1
+            if report.get('stopped'):
+                stopped = True
+                break
+        except Exception as exc:
+            failed.append({'file': workbook.name, 'error': str(exc)})
+        finally:
+            processed_queue_rows += workbook_rows[workbook]
+    if not reports and failed:
+        first = failed[0]
+        raise ValueError(
+            f'没有任何 XLSX 完成翻译。配置目录：{metadata_dir}；'
+            f'首个失败：{first["file"]}：{first["error"]}'
+        )
+    return {'folder': str(folder.resolve()), 'config_dir': str(metadata_dir.resolve()), 'total_files': len(workbooks), 'completed_files': completed_count, 'skipped_completed_files': len(completed_before), 'processed_files': len(reports), 'remaining_files': max(0, len(workbooks) - completed_count), 'prioritized_vietnamese_files': prioritized_files, 'failed_files': len(failed), 'failures': failed[:50], 'stopped': stopped, 'reports': reports}
 
 
 def main():

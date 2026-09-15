@@ -165,6 +165,11 @@ def _encode_target(text:str)->bytes:
     ASCII/control markup is preserved byte-for-byte.  This mirrors the mixed decoder used
     by the analyzer and allows partially translated strings to remain buildable.
     """
+    # Keep the legacy UI path in lockstep with the raw-cell encoder, including
+    # TCVN3 horned vowels such as Ứ/ự.
+    from localization_analyzer import encode_legacy_text
+    return encode_legacy_text(text)
+
     import unicodedata
     from localization_analyzer import TCVN_MAP, VI_CHARS
 
@@ -255,34 +260,134 @@ def _read_index(blob:bytes):
 def rebuild_pak(original_pak:Path,modified_dir:Path,changed_files:list[str],output:Path):
     blob=original_pak.read_bytes(); count,old_idx,entries=_read_index(blob)
     changed_indices={int(x.split('_',1)[0]) for x in changed_files}
-    # Preserve the complete original archive and every unchanged entry at its
-    # original absolute offset. These legacy PAKs are physically ordered by
-    # asset layout, not by index order; repacking all entries in index order can
-    # make the game lose sprites/maps even though our own extractor succeeds.
-    # Changed streams are appended after the old archive, followed by a fresh
-    # terminal index. The old index becomes harmless preserved padding.
-    out=bytearray(blob); new_entries=[]
     files_by_idx={}
     for name in changed_files:
         p=modified_dir/name
         if p.is_file() and re.match(r'^\d+_',p.name):
             files_by_idx[int(p.name.split('_',1)[0])]=p
+
+    # Rebuild in the archive's physical offset order.  The old implementation
+    # kept the entire original PAK, appended every changed stream, then appended
+    # a second index.  That made each build permanently larger and left stale
+    # archive structures in the output.  Repacking in index order is also unsafe
+    # for this game because physical gaps contain non-indexed bytes and duplicate
+    # index entries may alias the same payload.  This implementation preserves:
+    #   * the original 32-byte header/prefix and every physical gap byte;
+    #   * unchanged compressed payloads byte-for-byte;
+    #   * duplicate/aliased payloads when their resulting bytes still match;
+    # while writing changed payloads once and emitting exactly one final index.
+    by_offset={}
     for e in entries:
-        if e['index'] in changed_indices:
-            p=files_by_idx.get(e['index'])
-            if not p: raise ValueError(f'Modified entry file missing: {e["index"]}')
-            raw=p.read_bytes(); packed_data=nrv2b_compress(raw); real=len(raw); method=1; off=len(out)
-            out.extend(packed_data)
-        else:
-            packed_data=blob[e['offset']:e['offset']+e['packed']]; real=e['real']; method=e['method']; off=e['offset']
-        if len(packed_data)>0xFFFFFF: raise ValueError(f'Entry {e["index"]} packed size exceeds 24-bit field')
-        new_entries.append((e['hid'],off,real,len(packed_data),method))
+        by_offset.setdefault(e['offset'],[]).append(e)
+    physical_offsets=sorted(by_offset)
+    if not physical_offsets:
+        raise ValueError('PAK 没有可重建的资源条目')
+    first_offset=physical_offsets[0]
+    if first_offset<12 or first_offset>old_idx:
+        raise ValueError(f'PAK 首资源偏移异常：{first_offset}')
+    out=bytearray(blob[:first_offset])
+    new_by_index={}
+    old_cursor=first_offset
+    unchanged_payloads=0
+    alias_entries=0
+    for old_offset in physical_offsets:
+        group=sorted(by_offset[old_offset],key=lambda item:item['index'])
+        group_old_end=max(old_offset+e['packed'] for e in group)
+        if old_offset<old_cursor:
+            # Exact aliases are supported; partially overlapping payloads are
+            # ambiguous and must never be guessed around.
+            if old_offset!=group[0]['offset'] or group_old_end>old_cursor:
+                raise ValueError(f'PAK 存在无法安全重建的重叠资源：offset={old_offset}')
+        elif old_offset>old_cursor:
+            out.extend(blob[old_cursor:old_offset])
+
+        variants={}
+        for e in group:
+            if e['index'] in changed_indices:
+                p=files_by_idx.get(e['index'])
+                if not p:
+                    raise ValueError(f'Modified entry file missing: {e["index"]}')
+                # The builder implements NRV2B method 1 only.  Re-labeling a
+                # method-17 stream as method 1 can pass our own extractor yet
+                # crash the game's native reader.  Refuse that transformation
+                # until the original method has a verified encoder.
+                if e['method'] != 1:
+                    raise ValueError(
+                        f'Entry {e["index"]} uses compression method {e["method"]}; '
+                        'this Studio cannot safely rewrite it. Keep the original payload.'
+                    )
+                raw=p.read_bytes()
+                packed_data=nrv2b_compress(raw)
+                real=len(raw); method=1
+            else:
+                packed_data=blob[e['offset']:e['offset']+e['packed']]
+                real=e['real']; method=e['method']
+                unchanged_payloads+=1
+            if len(packed_data)>0xFFFFFF:
+                raise ValueError(f'Entry {e["index"]} packed size exceeds 24-bit field')
+            variant_key=(packed_data,real,method)
+            if variant_key in variants:
+                off=variants[variant_key]
+                alias_entries+=1
+            else:
+                off=len(out)
+                out.extend(packed_data)
+                variants[variant_key]=off
+            new_by_index[e['index']] = (e['hid'],off,real,len(packed_data),method)
+        old_cursor=max(old_cursor,group_old_end)
+    if old_cursor<old_idx:
+        out.extend(blob[old_cursor:old_idx])
+
+    new_entries=[new_by_index[i] for i in range(count)]
     new_idx=len(out)
     for hid,off,real,packed,method in new_entries:
         out.extend(struct.pack('<III',hid,off,real)); out.extend(int(packed).to_bytes(3,'little')); out.append(method)
     struct.pack_into('<I',out,4,count); struct.pack_into('<I',out,8,new_idx)
+    # Final structural gate.  A successful self-extraction is necessary but not
+    # sufficient: verify the index itself, exact archive boundary, non-overlap,
+    # and byte identity of every untouched compressed stream before publishing.
+    rebuilt_blob=bytes(out)
+    parsed_count,parsed_idx,parsed_entries=_read_index(rebuilt_blob)
+    if parsed_count!=count or parsed_idx!=new_idx:
+        raise ValueError('PAK 索引数量或偏移回读不一致')
+    if len(rebuilt_blob)!=new_idx+count*ENTRY_SIZE:
+        raise ValueError('PAK 末尾存在多余旧索引或未登记数据')
+    unique_spans={}
+    for old,new in zip(entries,parsed_entries):
+        if old['hid']!=new['hid']:
+            raise ValueError(f'Entry {old["index"]} 资源标识发生变化')
+        start=new['offset']; end=start+new['packed']
+        if start<first_offset or end>new_idx:
+            raise ValueError(f'Entry {old["index"]} 数据偏移越界')
+        span=(start,end)
+        for known_start,known_end in unique_spans:
+            if span==(known_start,known_end):
+                continue
+            if start<known_end and end>known_start:
+                raise ValueError(f'Entry {old["index"]} 与其他资源数据重叠')
+        unique_spans[span]=True
+        if old['index'] not in changed_indices:
+            old_payload=blob[old['offset']:old['offset']+old['packed']]
+            new_payload=rebuilt_blob[start:end]
+            if (
+                new_payload!=old_payload
+                or new['real']!=old['real']
+                or new['packed']!=old['packed']
+                or new['method']!=old['method']
+            ):
+                raise ValueError(f'Entry {old["index"]} 未修改资源未能逐字节保留')
     output.parent.mkdir(parents=True,exist_ok=True); output.write_bytes(out)
-    return {'entries':count,'changed_entries':len(changed_indices),'archive_size':len(out),'index_offset':new_idx}
+    return {
+        'entries':count,
+        'changed_entries':len(changed_indices),
+        'unchanged_payloads':unchanged_payloads,
+        'alias_entries':alias_entries,
+        'archive_size':len(out),
+        'original_archive_size':len(blob),
+        'size_delta':len(out)-len(blob),
+        'index_offset':new_idx,
+        'rebuild_mode':'compact-physical-order-v1',
+    }
 
 def changed_files_between(original_dir:Path, modified_dir:Path):
     changed=[]
@@ -301,11 +406,17 @@ def changed_files_between(original_dir:Path, modified_dir:Path):
 UTF8_TEXT_EXTENSIONS={'.tsv','.csv','.ini','.txt','.lua'}
 
 def _normalize_all_text_resources_utf8(original_dir:Path, modified_dir:Path)->list[str]:
-    """Stage every official text resource as strict UTF-8, translated or not."""
+    """Stage every legacy text resource as UTF-8, including untranslated files."""
     normalized=[]
     modified_dir.mkdir(parents=True,exist_ok=True)
-    names={p.name for p in original_dir.iterdir() if p.is_file() and p.suffix.lower() in UTF8_TEXT_EXTENSIONS}
-    names.update(p.name for p in modified_dir.iterdir() if p.is_file() and p.suffix.lower() in UTF8_TEXT_EXTENSIONS)
+    names={
+        p.name for p in original_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in UTF8_TEXT_EXTENSIONS
+    }
+    names.update(
+        p.name for p in modified_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in UTF8_TEXT_EXTENSIONS
+    )
     for name in sorted(names):
         src=original_dir/name
         dst=modified_dir/name
@@ -412,16 +523,6 @@ def _auto_repair_modified_resources(original_dir:Path, modified_dir:Path, candid
     def structural_angle_tags(cell:bytes)->list[bytes]:
         return angle_tag_re.findall(cell)
 
-    def same_logical(old:bytes,new:bytes)->bool:
-        """Treat a pure legacy-to-UTF-8 byte conversion as unchanged structure."""
-        return decode_best(old)[0] == decode_best(new)[0]
-
-    def logical_tags(value:bytes)->list[str]:
-        return re.findall(r'(?<!<)<[^<>\r\n]{1,160}>(?!>)',decode_best(value)[0])
-
-    def resource_paths(value:bytes)->list[str]:
-        return re.findall(RESOURCE_PATH_PATTERN,decode_best(value)[0],re.I)
-
     def changed_placeholder_cells(before_items:list[bytes], after_items:list[bytes])->list[str]:
         out=[]
         for row,(old_line,new_line) in enumerate(zip(before_items,after_items),1):
@@ -481,6 +582,13 @@ def _auto_repair_modified_resources(original_dir:Path, modified_dir:Path, candid
             continue
         sep,had_terminal_newline=_line_ending(after)
         changed=False
+        def same_logical(old_value:bytes,new_value:bytes)->bool:
+            return decode_best(old_value)[0] == decode_best(new_value)[0]
+        def logical_tags(value:bytes)->list[str]:
+            return re.findall(r'(?<!<)<[^<>\r\n]{1,160}>(?!>)',decode_best(value)[0])
+        def resource_paths(value:bytes)->list[str]:
+            return re.findall(RESOURCE_PATH_PATTERN,decode_best(value)[0],re.I)
+
         if ext=='.txt' and (b'<style' in before.lower() or b'<script' in before.lower()):
             old_blocks=list(code_block_re.finditer(before))
             new_blocks=list(code_block_re.finditer(after))
@@ -504,7 +612,8 @@ def _auto_repair_modified_resources(original_dir:Path, modified_dir:Path, candid
                     changed=True
             else:
                 unresolved.append(f'{name}: HTML style/script 代码块数量不一致，无法自动修复')
-        if ext=='.tsv' and before_lines and after_lines and before_lines[0]!=after_lines[0] and not same_logical(before_lines[0],after_lines[0]):
+        if (ext=='.tsv' and before_lines and after_lines and before_lines[0]!=after_lines[0]
+                and not same_logical(before_lines[0],after_lines[0])):
             after_lines[0]=before_lines[0]
             repaired.append(f'{name}:1:TSV 表头')
             changed=True
@@ -517,12 +626,14 @@ def _auto_repair_modified_resources(original_dir:Path, modified_dir:Path, candid
                     new_line=old_line
                     repaired.append(f'{name}:{row}:残留占位符回退')
                     changed=True
-                if len(old_cells)==len(new_cells)==1 and old_cells[0]!=new_cells[0] and is_resource_path(old_cells[0]) and resource_paths(old_cells[0])!=resource_paths(new_cells[0]):
+                if (len(old_cells)==len(new_cells)==1 and old_cells[0]!=new_cells[0]
+                        and is_resource_path(old_cells[0]) and resource_paths(old_cells[0])!=resource_paths(new_cells[0])):
                     after_lines[row-1]=old_line
                     new_line=old_line
                     repaired.append(f'{name}:{row}:资源路径回退')
                     changed=True
-                if len(old_cells)==len(new_cells)==1 and logical_tags(old_cells[0])!=logical_tags(new_cells[0]):
+                if (len(old_cells)==len(new_cells)==1
+                        and logical_tags(old_cells[0])!=logical_tags(new_cells[0])):
                     after_lines[row-1]=old_line
                     new_line=old_line
                     repaired.append(f'{name}:{row}:尖括号控制标记回退')
@@ -532,13 +643,15 @@ def _auto_repair_modified_resources(original_dir:Path, modified_dir:Path, candid
                     reverted_placeholders=0
                     reverted_tags=0
                     for col in range(len(new_cells)):
-                        if old_cells[col]!=new_cells[col] and is_resource_path(old_cells[col]) and resource_paths(old_cells[col])!=resource_paths(new_cells[col]):
+                        if (old_cells[col]!=new_cells[col] and is_resource_path(old_cells[col])
+                                and resource_paths(old_cells[col])!=resource_paths(new_cells[col])):
                             new_cells[col]=old_cells[col]
                             restored_paths+=1
                         if old_cells[col]!=new_cells[col] and diamond_placeholder_re.search(new_cells[col]):
                             new_cells[col]=old_cells[col]
                             reverted_placeholders+=1
-                        if old_cells[col]!=new_cells[col] and logical_tags(old_cells[col])!=logical_tags(new_cells[col]):
+                        if (old_cells[col]!=new_cells[col]
+                                and logical_tags(old_cells[col])!=logical_tags(new_cells[col])):
                             new_cells[col]=old_cells[col]
                             reverted_tags+=1
                     if restored_paths:
@@ -687,9 +800,6 @@ def _validate_modified_resources(original_dir:Path, modified_dir:Path, changed_f
     def structural_angle_tags(cell:bytes)->list[bytes]:
         return angle_tag_re.findall(cell)
 
-    def same_logical(old:bytes,new:bytes)->bool:
-        return decode_best(old)[0] == decode_best(new)[0]
-
     def logical_tags(cell:bytes)->list[str]:
         return re.findall(r'(?<!<)<[^<>\r\n]{1,160}>(?!>)',readable(cell))
 
@@ -735,6 +845,8 @@ def _validate_modified_resources(original_dir:Path, modified_dir:Path, changed_f
                         issues.append(f'{name}: HTML style/script 代码块被改变（块 {idx}）')
         for row,(old,new) in enumerate(zip(before_lines,after_lines),1):
             if ext=='.lua':
+                # Decode the complete line first.  Tiny isolated legacy tag
+                # fragments are too short for reliable codec detection.
                 old_utf8=decode_best(old)[0].encode('utf-8')
                 new_utf8=decode_best(new)[0].encode('utf-8')
                 old_code=lua_code_skeleton(old_utf8)
@@ -792,13 +904,21 @@ def _validate_modified_resources(original_dir:Path, modified_dir:Path, changed_f
         raise ValueError('文本资源结构校验失败，已阻止构建损坏的 PAK：'+' | '.join(issues[:30]))
 
 def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_name:str, output_dir:Path):
+    from localization_analyzer import is_structural_translation_payload
     records=json.loads(records_path.read_text(encoding='utf-8'))
     translated_statuses={'已翻译','已迁移','已审核'}
     modified=[
         r for r in records
         if r.get('pak')==pak_name
         and r.get('source_file')
+        # Older record caches do not contain this derived field.  They were
+        # already filtered by the analyzer, so absence must remain compatible;
+        # only an explicit False excludes an internal field.
         and r.get('_isPlayerVisible',True) is True
+        # Old workspaces can contain CSS / stateful <color=...> directives
+        # admitted before the strict analyzer existed.  They are never safe to
+        # rebuild; retain the original resource bytes instead.
+        and not is_structural_translation_payload(str(r.get('source_original') or r.get('original') or ''))
         and (
             exchange_text(r.get('original','')) != exchange_text(r.get('source_original',r.get('original','')))
             or (
@@ -817,7 +937,12 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
     # and emit only files that actually own translated records.
     raw_candidate=extracted.parent.parent/'_raw_reference'/extracted.name
     source_root=raw_candidate if raw_candidate.is_dir() else extracted
-    normalized_files=_normalize_all_text_resources_utf8(source_root,output_dir)
+    # A translation build must be sparse.  Re-encoding every text resource
+    # (including untouched Lua, layout and entity tables) changed 100+ files
+    # for a single Ollama run and could break runtime-only fields.  Start from
+    # exact archive bytes and create a file only when a validated record in it
+    # is actually written below.
+    normalized_files=[]
     byfile={}
     for r in modified:
         name=r.get('source_file')
@@ -826,6 +951,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
         byfile.setdefault(name,[]).append(r)
     changed_files=list(normalized_files)
     skipped=[]
+    fallbacks=[]
     for name,recs in byfile.items():
         source_path=source_root/name
         p=output_dir/name
@@ -834,7 +960,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
             continue
         p.parent.mkdir(parents=True,exist_ok=True)
         if not p.is_file():
-            p.write_bytes(normalize_text_resource_utf8(source_path.read_bytes(),source_path.suffix.lower()))
+            shutil.copyfile(source_path,p)
         ext=p.suffix.lower()
         if ext not in ('.tsv','.csv','.ini','.txt','.lua'):
             skipped.append({'file':name,'reason':f'unsupported extension {ext}','count':len(recs)})
@@ -879,11 +1005,14 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
             # restore it deterministically for every text resource type.
             if source.startswith('#') and target.startswith('◈') and not target.startswith('◈1◈'):
                 target='#'+target[1:]
+            if '\ufffd' in target:
+                fallbacks.append({'file':name,'id':r.get('id'),'reason':'译文包含 Unicode 替换字符 U+FFFD，已保留原始资源文本'})
+                continue
             if re.search(r'\{P\d+[^{}\r\n]*\}',target):
-                skipped.append({'file':name,'id':r.get('id'),'reason':'unresolved placeholder'})
+                fallbacks.append({'file':name,'id':r.get('id'),'reason':'占位符未还原，已保留原始资源文本'})
                 continue
             if any(target.count(ch)!=source.count(ch) for ch in ('\t','\r','\n')):
-                skipped.append({'file':name,'id':r.get('id'),'reason':'embedded tab/newline would change resource structure'})
+                fallbacks.append({'file':name,'id':r.get('id'),'reason':'制表符/换行会改变资源结构，已保留原始资源文本'})
                 continue
             if ext in ('.ini','.txt'):
                 structural=re.match(r'^[#$=]+',source)
@@ -891,7 +1020,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                     target=structural.group(0)+target
             ok,source_tokens,target_tokens=validate_tokens(source,target)
             if not ok:
-                skipped.append({'file':name,'id':r.get('id'),'reason':'protected token mismatch','source_tokens':source_tokens,'target_tokens':target_tokens})
+                fallbacks.append({'file':name,'id':r.get('id'),'reason':'控制标记不一致，已保留原始资源文本','source_tokens':source_tokens,'target_tokens':target_tokens})
                 continue
             updates[(row,col)]=(target,str(r.get('encoding','')),r.get('id'))
         working_bytes=original_bytes
@@ -909,7 +1038,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                     try:
                         replacements[col_no]=encode_cell(target,literal.content,source_encoding)
                     except (UnicodeEncodeError,ValueError) as exc:
-                        skipped.append({'file':name,'id':record_id,'reason':f'encoding failed: {exc}'})
+                        fallbacks.append({'file':name,'id':record_id,'reason':f'译文无法使用游戏编码表示，已保留原始资源文本: {exc}'})
                 lines[row_no-1],applied=replace_lua_text_parts(raw,replacements)
                 file_changed=file_changed or bool(applied)
                 continue
@@ -922,7 +1051,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                     try:
                         encoded=encode_cell(target,original,source_encoding)
                     except (UnicodeEncodeError,ValueError) as exc:
-                        skipped.append({'file':name,'id':record_id,'reason':f'encoding failed: {exc}'})
+                        fallbacks.append({'file':name,'id':record_id,'reason':f'译文无法使用游戏编码表示，已保留原始资源文本: {exc}'})
                         continue
                     left_len=len(original)-len(original.lstrip(b' \t'))
                     right_len=len(original)-len(original.rstrip(b' \t'))
@@ -942,7 +1071,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                         try:
                             cells[col_no-1]=encode_cell(target,cells[col_no-1],source_encoding)
                         except (UnicodeEncodeError,ValueError) as exc:
-                            skipped.append({'file':name,'id':record_id,'reason':f'encoding failed: {exc}'})
+                            fallbacks.append({'file':name,'id':record_id,'reason':f'译文无法使用游戏编码表示，已保留原始资源文本: {exc}'})
                             continue
                         file_changed=True
                     lines[row_no-1]=b'\t'.join(cells)
@@ -955,7 +1084,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                     try:
                         encoded=encode_cell(target,original,source_encoding)
                     except (UnicodeEncodeError,ValueError) as exc:
-                        skipped.append({'file':name,'id':record_id,'reason':f'encoding failed: {exc}'})
+                        fallbacks.append({'file':name,'id':record_id,'reason':f'译文无法使用游戏编码表示，已保留原始资源文本: {exc}'})
                         continue
                     lines[row_no-1]=(match.group(1) if match else b'')+encoded
                     file_changed=True
@@ -969,7 +1098,7 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
                     try:
                         cells[col_no-1]=encode_text_for_source(target,source_encoding,cells[col_no-1])
                     except (UnicodeEncodeError,ValueError) as exc:
-                        skipped.append({'file':name,'id':record_id,'reason':f'encoding failed: {exc}'})
+                        fallbacks.append({'file':name,'id':record_id,'reason':f'译文无法使用游戏编码表示，已保留原始资源文本: {exc}'})
                         continue
                     file_changed=True
             lines[row_no-1]=sep.join(cells)
@@ -980,19 +1109,42 @@ def materialize_records_to_modified_dir(extracted:Path, records_path:Path, pak_n
             p.write_bytes(rebuilt)
             if name not in changed_files:
                 changed_files.append(name)
-    _validate_changed_text_resources_utf8(output_dir,changed_files,source_root)
-    encoding_mode='all-text-resources-utf8-v1'
-    report={'output_dir':str(output_dir),'pak':pak_name,'encoding':encoding_mode,'modified_records':len(modified),'changed_files':changed_files,'changed_file_count':len(changed_files),'normalized_text_files':len(normalized_files),'skipped_count':len(skipped),'skipped':skipped[:100],'skipped_ids':list(dict.fromkeys(str(item.get('id') or '') for item in skipped if item.get('id'))),'no_safe_changes':not changed_files,'no_changes':not changed_files}
+    # Only translated cells are UTF-8.  Untouched cells deliberately remain
+    # byte-identical to the original archive; forcing their legacy bytes
+    # through a generic decoder is not a safe localization operation.
+    encoding_mode='translated-cells-utf8-v1'
+    report={'output_dir':str(output_dir),'pak':pak_name,'encoding':encoding_mode,'modified_records':len(modified),'changed_files':changed_files,'changed_file_count':len(changed_files),'normalized_text_files':len(normalized_files),'skipped_count':len(skipped),'skipped':skipped[:100],'skipped_ids':list(dict.fromkeys(str(item.get('id') or '') for item in skipped if item.get('id'))),'safe_fallback_count':len(fallbacks),'safe_fallbacks':fallbacks[:100],'safe_fallback_ids':list(dict.fromkeys(str(item.get('id') or '') for item in fallbacks if item.get('id'))),'no_safe_changes':not changed_files,'no_changes':not changed_files}
     output_dir.mkdir(parents=True,exist_ok=True)
     (output_dir/'_records_materialize_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
 
-def build_from_modified_dir(original_pak:Path, original_dir:Path, modified_dir:Path, output:Path, workers:int=1, verify:bool=True):
+def build_from_modified_dir(original_pak:Path, original_dir:Path, modified_dir:Path, output:Path, workers:int=1, verify:bool=True,
+                            exclude_extensions:set[str]|None=None, exclude_files:set[str]|None=None):
     _validate_original_matches_manifest(original_pak,original_dir)
+    excluded={str(ext).strip().lower() for ext in (exclude_extensions or set()) if str(ext).strip()}
+    excluded={ext if ext.startswith('.') else f'.{ext}' for ext in excluded}
+    excluded_names={Path(str(name)).name.lower() for name in (exclude_files or set()) if str(name).strip()}
+
+    def restore_excluded_original_bytes(target_dir:Path):
+        """A/B gate: excluded types must stay byte-identical to extracted input."""
+        if not excluded and not excluded_names:
+            return []
+        restored=[]
+        for source in original_dir.iterdir():
+            if not source.is_file() or (source.suffix.lower() not in excluded and source.name.lower() not in excluded_names):
+                continue
+            target=target_dir/source.name
+            if not target.exists() or target.read_bytes()!=source.read_bytes():
+                target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copyfile(source,target)
+                restored.append(source.name)
+        return restored
+
     with tempfile.TemporaryDirectory(prefix='pakloc_build_work_') as work_td:
         build_modified=Path(work_td)/'modified'
         shutil.copytree(modified_dir,build_modified)
-        normalized_files=_normalize_all_text_resources_utf8(original_dir,build_modified)
+        normalized_files=[]
+        restore_excluded_original_bytes(build_modified)
         changed=_dedupe_changed_files(changed_files_between(original_dir,build_modified))
         if not changed:
             raise ValueError('没有检测到可构建的修改文件，且原包文本已经全部是 UTF-8')
@@ -1000,19 +1152,22 @@ def build_from_modified_dir(original_pak:Path, original_dir:Path, modified_dir:P
         if int(repair_report.get('unresolved_count') or 0):
             problems=' | '.join(repair_report.get('unresolved',[])[:20])
             raise ValueError('文本资源自动修复失败，已阻止构建损坏的 PAK：'+problems)
-        # Structural repair may restore legacy source bytes; enforce the final
-        # codec again before validation and archive construction.
-        post_repair_normalized=_normalize_all_text_resources_utf8(original_dir,build_modified)
-        normalized_files=list(dict.fromkeys([*normalized_files,*post_repair_normalized]))
+        # Structural repair restores exact original bytes for protected parts.
+        # Never run a whole-file decoder after that restoration.
+        restore_excluded_original_bytes(build_modified)
         changed=_dedupe_changed_files(changed_files_between(original_dir,build_modified))
         if not changed:
             raise ValueError('没有检测到可构建的修改文件')
-        _validate_changed_text_resources_utf8(build_modified,changed,original_dir)
         _validate_modified_resources(original_dir,build_modified,changed)
-        info=rebuild_pak(original_pak,build_modified,changed,output)
+        # Build and verify in an isolated temporary path.  A failed verification
+        # must never replace the last known-good PAK in the user's build folder.
+        candidate=Path(work_td)/('candidate'+output.suffix)
+        info=rebuild_pak(original_pak,build_modified,changed,candidate)
         if verify:
             verify_dir=Path(work_td)/'verify'
-            out_dir,count,ok,fail,methods,types=extract_one(output,verify_dir,workers=workers)
+            out_dir,count,ok,fail,methods,types=extract_one(candidate,verify_dir,workers=workers)
+            if fail or ok!=count or count!=int(info.get('entries') or 0):
+                raise ValueError(f'PAK 完整回读失败：entries={info.get("entries")}, count={count}, ok={ok}, fail={fail}')
             mismatches=[]
             changed_indices={int(name.split('_',1)[0]) for name in changed}
             expected_by_idx={
@@ -1027,9 +1182,22 @@ def build_from_modified_dir(original_pak:Path, original_dir:Path, modified_dir:P
                     mismatches.append(i)
             if mismatches:
                 raise ValueError(f'Round-trip 内容不一致：{mismatches[:20]}')
-            report={**info,'output':str(output),'sha256':sha256(output),'changed_files':changed,'normalized_utf8_files':normalized_files,'encoding':'all-text-resources-utf8-v1','utf8_gate':'pass','auto_repair':repair_report,'roundtrip':'pass','verify_ok':ok,'verify_count':count,'verify_failed':fail}
+            report={**info,'output':str(output),'sha256':sha256(candidate),'changed_files':changed,'normalized_utf8_files':len(normalized_files),'encoding':'translated-cells-utf8-v1','utf8_gate':'translated-cells-pass','auto_repair':repair_report,'roundtrip':'pass','verify_ok':ok,'verify_count':count,'verify_failed':fail}
         else:
-            report={**info,'output':str(output),'sha256':sha256(output),'changed_files':changed,'normalized_utf8_files':normalized_files,'encoding':'all-text-resources-utf8-v1','utf8_gate':'pass','auto_repair':repair_report,'roundtrip':'skipped','verify_ok':None,'verify_count':None,'verify_failed':None}
+            report={**info,'output':str(output),'sha256':sha256(candidate),'changed_files':changed,'normalized_utf8_files':len(normalized_files),'encoding':'translated-cells-utf8-v1','utf8_gate':'translated-cells-pass','auto_repair':repair_report,'roundtrip':'skipped','verify_ok':None,'verify_count':None,'verify_failed':None}
+        output.parent.mkdir(parents=True,exist_ok=True)
+        # The workspace may live on D: while Windows' temporary directory is
+        # on C:. os.replace cannot cross volumes, so copy the verified archive
+        # to a same-directory staging file and atomically publish from there.
+        stage_fd,stage_name=tempfile.mkstemp(prefix=f'.{output.name}.',suffix='.verified.tmp',dir=output.parent)
+        os.close(stage_fd)
+        stage=Path(stage_name)
+        try:
+            shutil.copy2(candidate,stage)
+            os.replace(stage,output)
+        finally:
+            if stage.exists():
+                stage.unlink()
     output.with_suffix(output.suffix+'.build.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
 
@@ -1047,5 +1215,13 @@ def build_from_workspace(workspace:Path,pak_name:str,output:Path|None=None):
     original=Path(item['path']); extracted=Path(item['extracted'])
     if output is None: output=workspace/'build'/Path(original).name
     modified=workspace/'modified'/Path(pak_name).stem
-    materialize_records_to_modified_dir(extracted,records_path,pak_name,modified)
+    materialize_report=materialize_records_to_modified_dir(extracted,records_path,pak_name,modified)
+    if int(materialize_report.get('skipped_count') or 0):
+        details=' | '.join(
+            f"{item.get('file')}:{item.get('id') or ''} {item.get('reason')}"
+            for item in materialize_report.get('skipped',[])[:20]
+        )
+        raise ValueError(
+            f'{pak_name} 有 {materialize_report.get("skipped_count")} 条界面编辑未能安全写回，已停止构建：{details}'
+        )
     return build_from_modified_dir(original,extracted,modified,output,workers=1,verify=True)

@@ -26,10 +26,10 @@ from merged_csv import (
 )
 from api_translator import fetch_models, translate_merged_csv, translate_csv_dir
 from api_reviewer import review_records
-from xlsx_localization import export_xlsx_mapping, import_xlsx_to_modified, apply_xlsx_to_records
+from xlsx_localization import export_xlsx_mapping, export_xlsx_file_queue, export_full_xlsx, export_multi_pak_full_xlsx, export_multi_pak_glossary_xlsx, import_xlsx_to_modified, apply_xlsx_to_records, apply_multi_pak_full_xlsx_to_records, apply_xlsx_folder_to_records, restore_records_from_materialize_report
 from export_untranslated_xlsx import run as export_untranslated_run
 from import_untranslated_xlsx import run as import_untranslated_run
-from ollama_batch_translate import run as ollama_translate_run
+from ollama_batch_translate import run as ollama_translate_run, run_folder as ollama_translate_folder_run
 from safe_pc_merge import run as safe_pc_merge_run
 
 try:
@@ -68,6 +68,38 @@ def normalize_tree_utf8(root:Path):
         examples=' | '.join(f"{item['file']}@{item['offset']}" for item in invalid[:20])
         raise ValueError(f'UTF-8 分析副本生成失败，已阻止分析和导出：{len(invalid)} 个文件仍含旧编码字节：{examples}')
     return report
+
+def refresh_records_from_sources(records_path:Path,pak_sources:list[tuple[str,Path]]):
+    """Add newly recognized visible records without overwriting existing edits."""
+    records_path=Path(records_path)
+    records=json.loads(records_path.read_text(encoding='utf-8'))
+    by_location={
+        (str(r.get('pak') or ''),str(r.get('source_file') or ''),int(r.get('line') or 0),int(r.get('column') or 1)):r
+        for r in records
+    }
+    added=[]; scanned=0; per_pak={}
+    for pak,folder in pak_sources:
+        fresh,_stats=analyze_folder(Path(folder),pak,workers=worker_count())
+        scanned+=len(fresh); pak_added=0
+        for rec in fresh:
+            key=(pak,str(rec.get('source_file') or ''),int(rec.get('line') or 0),int(rec.get('column') or 1))
+            if key in by_location:
+                existing=by_location[key]
+                existing['_isPlayerVisible']=True
+                existing.setdefault('source_original',existing.get('original',''))
+                continue
+            rec['source_original']=rec.get('original','')
+            rec['_isPlayerVisible']=True
+            records.append(rec);by_location[key]=rec;added.append(rec);pak_added+=1
+        per_pak[pak]={'scanned':len(fresh),'added':pak_added}
+    backup=''
+    if added:
+        candidate=records_path.with_name(records_path.name+'.before_visibility_refresh');suffix=0
+        while candidate.exists():
+            suffix+=1;candidate=records_path.with_name(records_path.name+f'.before_visibility_refresh.{suffix}')
+        shutil.copy2(records_path,candidate);backup=str(candidate)
+        records_path.write_text(json.dumps(records,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+    return {'records_path':str(records_path),'records':len(records),'scanned':scanned,'added':len(added),'per_pak':per_pak,'backup':backup}
 
 def import_paks(workspace:Path,paks:list[Path]):
     lower_process_priority()
@@ -147,6 +179,45 @@ def main(argv):
             records_path=Path(argv[6]) if len(argv)==7 else None
             report=export_xlsx_mapping(Path(argv[2]),Path(argv[3]),argv[4],argv[5],workers=worker_count(),records_path=records_path)
             emit({'event':'done','report':report})
+            return 0
+        if cmd=='export-xlsx-files':
+            if len(argv) not in (5,6,7): raise ValueError('Usage: studio_cli.py export-xlsx-files <extracted_dir> <xlsx_dir> <pak_name> [records_json] [config_dir]')
+            records_path=Path(argv[5]) if len(argv)==6 else None
+            if len(argv)==7:
+                records_path=Path(argv[5])
+            report=export_xlsx_file_queue(Path(argv[2]),Path(argv[3]),argv[4],workers=worker_count(),records_path=records_path,progress=lambda p:emit({'event':'progress',**p}),metadata_dir=Path(argv[6]) if len(argv)==7 else None)
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='export-xlsx-full':
+            if len(argv)!=8: raise ValueError('Usage: studio_cli.py export-xlsx-full <extracted_dir> <xlsx_dir> <base_name> <pak_name> <records_json> <config_dir>')
+            emit({'event':'progress','message':'正在把全部玩家可见文本合并为一个 XLSX…'})
+            report=export_full_xlsx(Path(argv[2]),Path(argv[3]),argv[4],argv[5],Path(argv[6]),metadata_dir=Path(argv[7]))
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='export-xlsx-multi-full':
+            if len(argv)<7: raise ValueError('Usage: studio_cli.py export-xlsx-multi-full <records_json> <xlsx_dir> <base_name> <config_dir> [pak_name ...]')
+            emit({'event':'progress','message':'正在把多个 PAK 的玩家可见文本合并为一个免占位符 XLSX…'})
+            report=export_multi_pak_full_xlsx(Path(argv[2]),Path(argv[3]),argv[4],metadata_dir=Path(argv[5]),pak_names=argv[6:])
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='export-xlsx-multi-remaining':
+            if len(argv)<7: raise ValueError('Usage: studio_cli.py export-xlsx-multi-remaining <records_json> <xlsx_dir> <base_name> <config_dir> [pak_name ...]')
+            emit({'event':'progress','message':'正在生成多个 PAK 的剩余越南文去重 XLSX…'})
+            report=export_multi_pak_full_xlsx(Path(argv[2]),Path(argv[3]),argv[4],metadata_dir=Path(argv[5]),pak_names=argv[6:],remaining_only=True)
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='export-xlsx-multi-glossary':
+            if len(argv)<7: raise ValueError('Usage: studio_cli.py export-xlsx-multi-glossary <records_json> <xlsx_dir> <base_name> <config_dir> [pak_name ...]')
+            emit({'event':'progress','message':'正在把多个 PAK 的安全可见词语导出为术语库 XLSX…'})
+            report=export_multi_pak_glossary_xlsx(Path(argv[2]),Path(argv[3]),argv[4],metadata_dir=Path(argv[5]),pak_names=argv[6:])
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='refresh-visible-records':
+            if len(argv)<5 or (len(argv)-3)%2: raise ValueError('Usage: studio_cli.py refresh-visible-records <records_json> <pak_name> <extracted_dir> [pak_name extracted_dir ...]')
+            pairs=[(argv[i],Path(argv[i+1])) for i in range(3,len(argv),2)]
+            emit({'event':'progress','message':'正在增量扫描并补齐遗漏的玩家可见文本…'})
+            report=refresh_records_from_sources(Path(argv[2]),pairs)
+            emit({'event':'done','report':report,'records_path':str(Path(argv[2]))})
             return 0
         if cmd=='import-tsv-csv':
             if len(argv)!=5: raise ValueError('Usage: studio_cli.py import-tsv-csv <extracted_dir> <csv_dir> <out_dir>')
@@ -244,6 +315,21 @@ def main(argv):
             report=apply_xlsx_to_records(Path(argv[2]),Path(argv[3]),Path(argv[4]),argv[5],progress=lambda p:emit({'event':'progress',**p}))
             emit({'event':'done','report':report,'records_path':str(Path(argv[2]))})
             return 0
+        if cmd=='apply-xlsx-multi-records':
+            if len(argv)!=5: raise ValueError('Usage: studio_cli.py apply-xlsx-multi-records <records_json> <xlsx_path> <mapping_json>')
+            report=apply_multi_pak_full_xlsx_to_records(Path(argv[2]),Path(argv[3]),Path(argv[4]),progress=lambda p:emit({'event':'progress',**p}))
+            emit({'event':'done','report':report,'records_path':str(Path(argv[2]))})
+            return 0
+        if cmd=='apply-xlsx-folder-records':
+            if len(argv) not in (5,6): raise ValueError('Usage: studio_cli.py apply-xlsx-folder-records <records_json> <xlsx_folder> <pak_name> [config_dir]')
+            report=apply_xlsx_folder_to_records(Path(argv[2]),Path(argv[3]),argv[4],progress=lambda p:emit({'event':'progress',**p}),metadata_dir=Path(argv[5]) if len(argv)==6 else None)
+            emit({'event':'done','report':report,'records_path':str(Path(argv[2]))})
+            return 0
+        if cmd=='restore-materialize-rejections':
+            if len(argv)!=4: raise ValueError('Usage: studio_cli.py restore-materialize-rejections <records_json> <materialize_report_json>')
+            report=restore_records_from_materialize_report(Path(argv[2]),Path(argv[3]))
+            emit({'event':'done','report':report,'records_path':str(Path(argv[2]))})
+            return 0
         if cmd=='api-review-records':
             if len(argv) not in (15,16): raise ValueError('Usage: studio_cli.py api-review-records <records_json> <pak_name> <output_dir> <base_url> <api_key> <model> <prompt_file> <batch_size> <db_path> <mode> <source_xlsx> <mapping_json> <extracted_dir> [selected_ids_json]')
             prompt=Path(argv[8]).read_text(encoding='utf-8') if Path(argv[8]).is_file() else ''
@@ -295,6 +381,11 @@ def main(argv):
             report=ollama_translate_run(Path(argv[2]),pak,max_buckets=max_buckets,bucket_size=bucket_size,xlsx=xlsx,
                 control_path=Path(argv[7]) if len(argv)>7 else None,
                 progress=lambda p:emit({'event':'progress','phase':'ollama',**p}))
+            emit({'event':'done','report':report})
+            return 0
+        if cmd=='ollama-translate-folder':
+            if len(argv) not in (5,6,7,8): raise ValueError('Usage: studio_cli.py ollama-translate-folder <workspace> <pak> <xlsx_folder> [bucket_size] [control] [config_dir]')
+            report=ollama_translate_folder_run(Path(argv[2]),argv[3],Path(argv[4]),bucket_size=int(argv[5]) if len(argv)>=6 else None,control_path=Path(argv[6]) if len(argv)>=7 else None,metadata_dir=Path(argv[7]) if len(argv)>=8 else None,progress=lambda p:emit({'event':'progress','phase':'ollama',**p}))
             emit({'event':'done','report':report})
             return 0
         if cmd=='import-untranslated-xlsx':

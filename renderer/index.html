@@ -11,7 +11,7 @@
   <header>
     <div>
       <h1>Cocos2D PAK Localization Studio</h1>
-      <div class="subtitle">V3-A Hotfix 5 · TSV/INI/TXT/LUA 文本资源本地化 / ID 精确导入 / 精简 CSV</div>
+      <div class="subtitle">文件队列版 · 保留原版界面 / 安全提取 / 按 TSV、INI、TXT、LUA 顺序连续翻译</div>
     </div>
     <div class="actions">
       <button id="translatorSettings" class="secondary">翻译设置</button>
@@ -39,15 +39,18 @@
     <section class="content">
       <div class="toolbar">
         <input id="search" placeholder="搜索 ID 或文本…" />
-        <button id="exportXlsx">导出 XLSX</button>
-        <button id="importXlsxPolish">导入润色</button>
-        <button id="apiReview">API 审校</button>
-        <button id="reReviewSelected" class="secondary" disabled>重新审核</button>
-        <button id="exportUntranslated">导出未翻译</button>
-        <button id="ollamaTranslate">Ollama 翻译</button>
-        <button id="importUntranslated">导回翻译</button>
-        <button id="safePcMerge">国际版迁移中文</button>
-        <button id="buildPak">构建 PAK</button>
+        <button id="exportXlsx">导出逐文件 XLSX</button>
+        <button id="importXlsxPolish">导入 XLSX 文件夹</button>
+        <button id="exportFullXlsx">导出全部 PAK XLSX</button>
+        <button id="exportGlossaryXlsx">导出术语库 XLSX</button>
+        <button id="exportUntranslated">导出未翻译 XLSX</button>
+        <button id="importFullXlsx">导入全部 PAK XLSX</button>
+        <button id="apiReview" class="hidden" tabindex="-1" aria-hidden="true">API 审校</button>
+        <button id="reReviewSelected" class="secondary hidden" disabled tabindex="-1" aria-hidden="true">重新审核</button>
+        <button id="ollamaTranslate">按文件 Ollama</button>
+        <button id="importUntranslated" class="hidden" tabindex="-1" aria-hidden="true">导回翻译</button>
+        <button id="safePcMerge" class="hidden" tabindex="-1" aria-hidden="true">国际版迁移中文</button>
+        <button id="buildPak">构建全部 PAK</button>
         <div id="advancedTools" class="advanced-tools hidden">
           <button id="pushGithubPak" class="secondary hidden" tabindex="-1" aria-hidden="true">推送 GitHub</button>
           <button id="autoModelBuild" class="secondary">API 安全翻译并构建</button>

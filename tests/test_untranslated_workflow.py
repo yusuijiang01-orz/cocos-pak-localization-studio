@@ -111,6 +111,23 @@ def test_ollama_progress_contains_restored_live_record_updates(tmp_path, monkeyp
     assert {u["id"]: u["text"] for u in updates} == {"1": "获得10金币", "2": "获得20金币"}
 
 
+def test_multi_pak_live_updates_rebuild_exact_skeleton_without_placeholders():
+    mapping = {
+        "records": [[
+            "1", "updatefs.pak", "0001.tsv", 1, 1, "获得金币", [
+                ["k", "$"], ["t", "s1", "Nhận "], ["p", "<c=g>"],
+                ["t", "s2", "vàng"], ["p", "</c>"],
+            ],
+        ]],
+    }
+    updates = ollama_batch_translate.multi_pak_live_updates(
+        mapping, ["s1"], {"s1": "获得"}, {"1": _record("1", "Nhận <c=g>vàng</c>")}
+    )
+    # The first segment is Chinese immediately; unfinished text and every
+    # protected runtime token remain exact source values until their turn.
+    assert updates == [{"id": "1", "text": "$获得<c=g>vàng</c>"}]
+
+
 def test_leaked_transport_markers_are_exported_again_from_clean_source():
     record = _record("1", "Thăng cấp vũ khí 120 lần thứ 4")
     record["source_original"] = "Thăng cấp vũ khí 120 lần thứ 4"

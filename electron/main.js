@@ -5,6 +5,12 @@ const { spawn } = require('child_process');
 const os = require('os');
 
 let win;
+const crashLog=path.join(__dirname,'..','studio-crash.log');
+function logMainFailure(kind,error){
+  try{fs.appendFileSync(crashLog,`[${new Date().toISOString()}] ${kind}: ${error?.stack||error}\n`,'utf8')}catch{}
+}
+process.on('uncaughtException',error=>logMainFailure('uncaughtException',error));
+process.on('unhandledRejection',error=>logMainFailure('unhandledRejection',error));
 const activeBackendProcesses = new Set();
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if(!hasSingleInstanceLock) app.quit();
@@ -35,7 +41,10 @@ function pythonCommand() {
   const isolated=process.platform==='win32'
     ? path.join(root,'.venv','Scripts','python.exe')
     : path.join(root,'.venv','bin','python');
-  return fs.existsSync(isolated) ? isolated : (process.platform === 'win32' ? 'python' : 'python3');
+  const parent=process.platform==='win32'
+    ? path.join(root,'..','.venv','Scripts','python.exe')
+    : path.join(root,'..','.venv','bin','python');
+  return fs.existsSync(isolated) ? isolated : fs.existsSync(parent) ? parent : (process.platform === 'win32' ? 'python' : 'python3');
 }
 
 function pythonSpawnOptions() {
@@ -51,6 +60,14 @@ function pythonSpawnOptions() {
 
 function pakItem(project, pakName) {
   return (project.paks || []).find(x => x.pak === pakName) || (project.paks || [])[0];
+}
+
+function playerVisibleXlsxRoot(workspace, base) {
+  return path.join(workspace,'xlsx_export',`${base}_player_visible`);
+}
+
+function multiPakXlsxRoot(workspace) {
+  return path.join(workspace,'xlsx_export','all_paks_player_visible');
 }
 
 function rawReferenceDir(project, item, pakName) {
@@ -225,7 +242,9 @@ function apiReviewStatus(project, pak) {
 }
 
 function modelPath() {
-  return path.join(__dirname, '..', 'models', 'nllb-200-distilled-600M');
+  const local=path.join(__dirname, '..', 'models', 'nllb-200-distilled-600M');
+  const parent=path.join(__dirname, '..', '..', 'models', 'nllb-200-distilled-600M');
+  return fs.existsSync(local) ? local : parent;
 }
 
 function apiConfigPath() {
@@ -373,7 +392,7 @@ function newestFileMtime(target) {
 }
 
 function needsRecordMaterialize(project, modifiedDir) {
-  const currentEncoding='force-utf8-v8';
+  const currentEncoding='translated-cells-utf8-v1';
   const recordsPath=path.join(project.workspace,'localization','text_records.json');
   if(!fs.existsSync(recordsPath)) return false;
   if(!fs.existsSync(modifiedDir)) return true;
@@ -431,6 +450,24 @@ function syncRecordsToResources(project,pak) {
   const queued=current.finally(()=>{if(recordSyncQueues.get(key)===queued)recordSyncQueues.delete(key)});
   recordSyncQueues.set(key,queued);
   return queued;
+}
+
+async function syncRecordsWithAutoReject(project,pak) {
+  const recordsPath=path.join(project.workspace,'localization','text_records.json');
+  let sync=await syncRecordsToResources(project,pak);
+  let autoRejected=0;
+  const repairBackups=[];
+  for(let round=0;round<10 && Number(sync?.report?.skipped_count||0)>0;round++) {
+    const reportPath=path.join(sync.outputDir,'_records_materialize_report.json');
+    const repaired=await runCli(['restore-materialize-rejections',recordsPath,reportPath],{suppressProgress:true});
+    if(!repaired.ok) throw new Error(repaired.error||'自动恢复结构错误译文失败');
+    const count=Number(repaired.report?.restored||0);
+    if(!count) break;
+    autoRejected+=count;
+    if(repaired.report?.backup) repairBackups.push(repaired.report.backup);
+    sync=await syncRecordsToResources(project,pak);
+  }
+  return {...sync,autoRejected,repairBackups};
 }
 
 function ensureModifiedDirInitialized(extractedDir, modifiedDir) {
@@ -639,15 +676,55 @@ ipcMain.handle('export-xlsx', async (_e,{project,pak}) => {
     const item=pakItem(project,pak);
     if(!item || !item.extracted) throw new Error('当前项目没有可用的解包目录');
     const base=pak.replace(/\.pak$/i,'');
-    const outDir=path.join(project.workspace,'xlsx_export',base);
+    const outDir=playerVisibleXlsxRoot(project.workspace,base);
     const recordsPath=path.join(project.workspace,'localization','text_records.json');
-    const args=['export-xlsx',item.extracted,outDir,base,pak];
-    if(fs.existsSync(recordsPath)) args.push(recordsPath);
+    const xlsxDir=path.join(outDir,'xlsx');
+    const configDir=path.join(outDir,'config');
+    const args=['export-xlsx-files',item.extracted,xlsxDir,pak,recordsPath,configDir];
     const res=await runCli(args);
     if(!res.ok) return res;
+    // Export is read-only. Never synchronously clone the entire extracted tree
+    // here: updatefs contains thousands of binary assets and the copy can block
+    // or kill Electron. Import/build materialize only changed text files later.
     const modifiedDir=path.join(project.workspace,'modified',base);
-    const modifiedInit=ensureModifiedDirInitialized(item.extracted,modifiedDir);
-    return {ok:true,report:res.report,xlsx:res.report.xlsx,mappingJson:res.report.mapping_json,mappingCsv:res.report.mapping_csv,outputDir:outDir,modifiedDir,modifiedInit};
+    const modifiedInit={created:false,reason:'export-is-read-only'};
+    return {ok:true,report:res.report,outputDir:xlsxDir,configDir,modifiedDir,modifiedInit};
+  } catch(e){ return {ok:false,error:e.message}; }
+});
+ipcMain.handle('export-full-xlsx', async (_e,{project}) => {
+  try {
+    const paks=[...new Set((project?.paks||[]).map(item=>item.pak).filter(Boolean))];
+    if(!project?.workspace || !paks.length) throw new Error('当前项目没有可用的 PAK');
+    const exportDir=multiPakXlsxRoot(project.workspace);
+    const xlsxDir=path.join(exportDir,'full_xlsx');
+    const configDir=path.join(exportDir,'config');
+    const recordsPath=path.join(project.workspace,'localization','text_records.json');
+    const exportBase='all_paks_player_visible_full';
+    const refreshArgs=['refresh-visible-records',recordsPath];
+    for(const pak of paks){const item=pakItem(project,pak);if(item?.extracted)refreshArgs.push(pak,item.extracted)}
+    const refreshed=await runCli(refreshArgs);
+    if(!refreshed.ok)return refreshed;
+    const res=await runCli(['export-xlsx-multi-full',recordsPath,xlsxDir,exportBase,configDir,...paks]);
+    if(!res.ok) return res;
+    return {ok:true,report:res.report,refresh:refreshed.report,records:readRecords(project.workspace),xlsxPath:res.report?.xlsx||path.join(xlsxDir,`${exportBase}_localization.xlsx`),outputDir:xlsxDir,configDir};
+  } catch(e){ return {ok:false,error:e.message}; }
+});
+ipcMain.handle('export-glossary-xlsx', async (_e,{project}) => {
+  try {
+    const paks=[...new Set((project?.paks||[]).map(item=>item.pak).filter(Boolean))];
+    if(!project?.workspace || !paks.length) throw new Error('当前项目没有可用的 PAK');
+    const exportDir=multiPakXlsxRoot(project.workspace);
+    const xlsxDir=path.join(exportDir,'term_glossary_xlsx');
+    const configDir=path.join(exportDir,'config');
+    const recordsPath=path.join(project.workspace,'localization','text_records.json');
+    const exportBase='all_paks_player_visible_terms';
+    const refreshArgs=['refresh-visible-records',recordsPath];
+    for(const pak of paks){const item=pakItem(project,pak);if(item?.extracted)refreshArgs.push(pak,item.extracted)}
+    const refreshed=await runCli(refreshArgs);
+    if(!refreshed.ok)return refreshed;
+    const res=await runCli(['export-xlsx-multi-glossary',recordsPath,xlsxDir,exportBase,configDir,...paks]);
+    if(!res.ok) return res;
+    return {ok:true,report:res.report,refresh:refreshed.report,records:readRecords(project.workspace),xlsxPath:res.report?.xlsx||path.join(xlsxDir,`${exportBase}_localization.xlsx`),outputDir:xlsxDir,configDir};
   } catch(e){ return {ok:false,error:e.message}; }
 });
 ipcMain.handle('import-xlsx-polish', async (_e,{project,pak}) => {
@@ -655,33 +732,99 @@ ipcMain.handle('import-xlsx-polish', async (_e,{project,pak}) => {
     const item=pakItem(project,pak);
     if(!item || !item.extracted) throw new Error('当前项目没有可用的解包目录');
     const base=pak.replace(/\.pak$/i,'');
-    const exportDir=path.join(project.workspace,'xlsx_export',base);
-    const mappingJson=path.join(exportDir,`${base}_localization_mapping.json`);
-    if(!fs.existsSync(mappingJson)) throw new Error(`未找到映射表：${mappingJson}。请先点击“导出 XLSX”。`);
-    const picked=await dialog.showOpenDialog(win,{title:'选择谷歌翻译后的 XLSX',defaultPath:exportDir,properties:['openFile'],filters:[{name:'Excel Workbook',extensions:['xlsx']}]});
+    const exportDir=playerVisibleXlsxRoot(project.workspace,base);
+    const picked=await dialog.showOpenDialog(win,{title:'选择只包含译后 XLSX 的文件夹',defaultPath:path.join(exportDir,'xlsx'),properties:['openDirectory']});
     if(picked.canceled || !picked.filePaths.length) return {ok:false,canceled:true};
-    const pickedXlsxPath=picked.filePaths[0];
-    let xlsxPath=pickedXlsxPath;
-    let migration=null;
-    const pickedMapping=path.join(path.dirname(pickedXlsxPath),`${base}_localization_mapping.json`);
-    if(fs.existsSync(pickedMapping) && path.resolve(pickedMapping)!==path.resolve(mappingJson)) {
-      const migratedXlsx=path.join(exportDir,`${base}_migrated_from_previous.xlsx`);
-      const remapped=await runCli(['remap-xlsx',pickedXlsxPath,pickedMapping,mappingJson,migratedXlsx]);
-      if(!remapped.ok) return remapped;
-      migration=remapped.report;
-      xlsxPath=migratedXlsx;
-    }
-    const modifiedDir=path.join(project.workspace,'modified',base);
-    const imported=await runCli(['import-xlsx',item.extracted,xlsxPath,mappingJson,modifiedDir]);
-    if(!imported.ok) return imported;
     const recordsPath=path.join(project.workspace,'localization','text_records.json');
-    let sync=null,records=null;
-    if(fs.existsSync(recordsPath)) {
-      sync=await runCli(['apply-xlsx-records',recordsPath,xlsxPath,mappingJson,pak]);
-      if(!sync.ok) return sync;
-      records=readRecords(project.workspace);
+    const xlsxFolder=picked.filePaths[0];
+    const adjacentConfig=path.join(path.dirname(xlsxFolder),'config');
+    const projectConfig=path.join(exportDir,'config');
+    const configFolder=fs.existsSync(adjacentConfig)?adjacentConfig:(fs.existsSync(projectConfig)?projectConfig:null);
+    const importArgs=['apply-xlsx-folder-records',recordsPath,xlsxFolder,pak];
+    if(configFolder) importArgs.push(configFolder);
+    const imported=await runCli(importArgs);
+    if(!imported.ok) return imported;
+    if(Number(imported.report?.failed_files||0)>0) {
+      return {ok:false,error:`XLSX 文件夹只完成了部分导入：${imported.report.imported_files||0}/${imported.report.total_files||0}，失败 ${imported.report.failed_files||0} 个。已停止资源同步，请先处理失败文件。`,report:imported.report,records:readRecords(project.workspace)};
     }
-    return {ok:true,import:imported.report,sync:sync?.report,records,xlsx:xlsxPath,sourceXlsx:pickedXlsxPath,migration,mappingJson,modifiedDir};
+    const sync=await syncRecordsWithAutoReject(project,pak);
+    const importedChanges=Number(imported.report?.changed||0);
+    const materialized=Number(sync?.report?.modified_records||0);
+    const changedFiles=Number(sync?.report?.changed_file_count||0);
+    const skipped=Number(sync?.report?.skipped_count||0);
+    if(skipped>0) {
+      return {ok:false,error:`自动恢复结构错误译文后仍有 ${skipped} 条无法写回资源。已阻止显示为完成。`,report:imported.report,sync:sync.report,records:readRecords(project.workspace)};
+    }
+    if(importedChanges>0 && (materialized===0 || changedFiles===0)) {
+      return {ok:false,error:`XLSX 已写入 ${importedChanges} 条译文，但没有生成任何可构建资源。已判定整条链路失败，不允许继续构建。`,report:imported.report,sync:sync.report,records:readRecords(project.workspace)};
+    }
+    return {ok:true,import:imported.report,sync:sync?.report,autoRejected:sync.autoRejected||0,repairBackups:sync.repairBackups||[],records:readRecords(project.workspace),sourceFolder:xlsxFolder,configFolder:imported.report?.config_dir,modifiedDir:sync.outputDir};
+  } catch(e){ return {ok:false,error:e.message}; }
+});
+ipcMain.handle('import-full-xlsx', async (_e,{project}) => {
+  try {
+    if(!project?.workspace) throw new Error('请先打开项目');
+    const exportDir=multiPakXlsxRoot(project.workspace);
+    const picked=await dialog.showOpenDialog(win,{
+      title:'选择译后的完整 XLSX',
+      defaultPath:path.join(exportDir,'full_xlsx'),
+      properties:['openFile'],
+      filters:[{name:'Excel 工作簿',extensions:['xlsx']}],
+    });
+    if(picked.canceled || !picked.filePaths.length) return {ok:false,canceled:true};
+    const sourceXlsx=picked.filePaths[0];
+    const workbookStem=path.basename(sourceXlsx,'.xlsx');
+    // Google/Windows may append a translated/copy suffix. Resolve the original
+    // Studio mapping without requiring the user to rename the translated file.
+    const workbookStems=[workbookStem];
+    let stripped=workbookStem;
+    for(const suffix of [/_translated$/i,/_google(?:_translated)?$/i,/\s*-\s*translated$/i,/\s*\(\d+\)$/]) {
+      stripped=stripped.replace(suffix,'');
+      if(stripped&&!workbookStems.includes(stripped)) workbookStems.push(stripped);
+    }
+    const mappingNames=workbookStems.map(stem=>`${stem}_mapping.json`);
+    const mappingCandidates=[];
+    for(const mappingName of mappingNames) mappingCandidates.push(
+      path.join(path.dirname(sourceXlsx),'config',mappingName),
+      path.join(path.dirname(path.dirname(sourceXlsx)),'config',mappingName),
+      path.join(exportDir,'config',mappingName),
+    );
+    const mappingJson=mappingCandidates.find(candidate=>fs.existsSync(candidate));
+    if(!mappingJson) throw new Error(`找不到所选 XLSX 的配套映射：${mappingNames.join('、')}。请保留 Studio 导出时生成的 config 文件夹。`);
+    const recordsPath=path.join(project.workspace,'localization','text_records.json');
+    const imported=await runCli(['apply-xlsx-multi-records',recordsPath,sourceXlsx,mappingJson]);
+    if(!imported.ok) return imported;
+    const syncs=[];
+    let autoRejected=0;
+    for(const pak of imported.report?.paks||[]) {
+      const sync=await syncRecordsWithAutoReject(project,pak);
+      syncs.push({pak,...sync.report,outputDir:sync.outputDir});
+      autoRejected+=Number(sync.autoRejected||0);
+      if(Number(sync.report?.skipped_count||0)>0) {
+        return {ok:false,error:`${pak} 自动恢复后仍有 ${sync.report.skipped_count} 条结构错误，已停止该 PAK 的资源同步。未翻译内容不会造成这个错误。`,report:imported.report,syncs,records:readRecords(project.workspace)};
+      }
+    }
+    const sync={
+      modified_records:syncs.reduce((n,x)=>n+Number(x.modified_records||0),0),
+      changed_file_count:syncs.reduce((n,x)=>n+Number(x.changed_file_count||0),0),
+      skipped_count:syncs.reduce((n,x)=>n+Number(x.skipped_count||0),0),
+    };
+    // Always leave the user with an exact, deduplicated second-pass workbook.
+    // It contains only text that is still Vietnamese after this import; rows
+    // already translated in the full workbook are intentionally omitted. Use a
+    // unique name: never overwrite the Google-translated workbook just selected.
+    const remainingDir=path.join(exportDir,'remaining_xlsx');
+    const importStamp=new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z');
+    const remainingBase=`all_paks_player_visible_remaining_${importStamp}`;
+    const remainingConfig=path.join(exportDir,'config');
+    const remaining=await runCli([
+      'export-xlsx-multi-remaining',recordsPath,remainingDir,remainingBase,
+      remainingConfig,...(imported.report?.paks||[]),
+    ]);
+    if(!remaining.ok) {
+      return {ok:false,error:`译文已经导入并同步，但生成“剩余未翻译 XLSX”失败：${remaining.error||'未知错误'}`,report:imported.report,sync,records:readRecords(project.workspace)};
+    }
+    return {ok:true,import:imported.report,sync,syncs,autoRejected,remaining:remaining.report,remainingXlsx:remaining.report?.xlsx,records:readRecords(project.workspace),sourceXlsx,mappingJson,modifiedDirs:syncs.map(x=>x.outputDir)};
   } catch(e){ return {ok:false,error:e.message}; }
 });
 ipcMain.handle('merge-tsv-csv', async (_e,{project,pak}) => {
@@ -882,7 +1025,7 @@ ipcMain.handle('model-translate-tsv-csv', async (_e,{project,pak}) => {
     return {ok:true,report:res.report,sync:sync?.report,records,inputDir:beforeDir,outputDir:afterDir};
   } catch(e){ return {ok:false,error:e.message}; }
 });
-ipcMain.handle('build-pak', async (_e,{project,pak}) => {
+async function buildOnePak(project,pak) {
   try {
     // Exporting the untranslated workbook scans the full records database and
     // writes an XLSX. It is an explicit user action, not a build prerequisite.
@@ -938,14 +1081,41 @@ ipcMain.handle('build-pak', async (_e,{project,pak}) => {
     if(!res.ok) return res;
     return {ok:true,report:res.report || res.result,output:(res.report || res.result)?.output,warning:qualityWarning};
   } catch(e){ return {ok:false,error:e.message}; }
+}
+
+ipcMain.handle('build-pak', async (_e,{project,pak}) => buildOnePak(project,pak));
+ipcMain.handle('build-paks', async (_e,{project,paks}) => {
+  try {
+    const names=[...new Set((paks&&paks.length?paks:(project?.paks||[]).map(item=>item.pak)).filter(Boolean))];
+    if(!names.length) throw new Error('当前项目没有可构建的 PAK');
+    const results=[];
+    for(let index=0;index<names.length;index++) {
+      win?.webContents.send('backend-progress',{event:'progress',phase:'build-paks',percent:Math.round(index*100/names.length),message:`正在构建 ${index+1}/${names.length}：${names[index]}`});
+      const result=await buildOnePak(project,names[index]);
+      results.push({pak:names[index],...result});
+      if(!result.ok) return {ok:false,error:`${names[index]} 构建失败：${result.error||'未知错误'}`,results};
+    }
+    win?.webContents.send('backend-progress',{event:'progress',phase:'build-paks',percent:100,message:`全部 ${names.length} 个 PAK 构建完成`});
+    return {ok:true,results,outputs:results.map(item=>item.output||item.report?.output)};
+  } catch(e){ return {ok:false,error:e.message}; }
 });
 
-ipcMain.handle('export-untranslated-xlsx', async (_e,{project,pak}) => {
+ipcMain.handle('export-untranslated-xlsx', async (_e,{project}) => {
   try {
-    if(!project || !project.workspace) throw new Error('请先打开项目');
-    const res=await runCli(['export-untranslated-xlsx',project.workspace,pak || 'all']);
+    const paks=[...new Set((project?.paks||[]).map(item=>item.pak).filter(Boolean))];
+    if(!project?.workspace || !paks.length) throw new Error('当前项目没有可用的 PAK');
+    const exportDir=multiPakXlsxRoot(project.workspace);
+    const xlsxDir=path.join(exportDir,'remaining_xlsx');
+    const configDir=path.join(exportDir,'config');
+    const recordsPath=path.join(project.workspace,'localization','text_records.json');
+    const exportBase='all_paks_player_visible_remaining';
+    const refreshArgs=['refresh-visible-records',recordsPath];
+    for(const pak of paks){const item=pakItem(project,pak);if(item?.extracted)refreshArgs.push(pak,item.extracted)}
+    const refreshed=await runCli(refreshArgs);
+    if(!refreshed.ok) return refreshed;
+    const res=await runCli(['export-xlsx-multi-remaining',recordsPath,xlsxDir,exportBase,configDir,...paks]);
     if(!res.ok) return res;
-    return {ok:true,report:res.report};
+    return {ok:true,report:res.report,refresh:refreshed.report,records:readRecords(project.workspace),xlsxPath:res.report?.xlsx||path.join(xlsxDir,`${exportBase}_localization.xlsx`),outputDir:xlsxDir,configDir};
   } catch(e){ return {ok:false,error:e.message}; }
 });
 let ollamaControlPath = null;
@@ -958,38 +1128,94 @@ ipcMain.handle('ollama-translate', async (_e,{project,pak,maxBuckets,bucketSize,
   if(ollamaControlPath) return {ok:false,error:'Ollama 任务已经运行'};
   try {
     if(!project || !project.workspace) throw new Error('请先打开项目');
-    const base=pak.replace(/\.pak$/i,'');
-    const defaultDir=path.join(project.workspace,'untranslated_xlsx',base);
-    const picked=await dialog.showOpenDialog(win,{title:`选择要交给 Ollama 翻译的 ${pak} XLSX`,defaultPath:defaultDir,properties:['openFile'],filters:[{name:'Excel Workbook',extensions:['xlsx']}]});
+    const fallbackPak=pak||project.paks?.map(item=>item.pak).find(Boolean);
+    if(!fallbackPak) throw new Error('当前项目没有可用的 PAK');
+    const base=fallbackPak.replace(/\.pak$/i,'');
+    const defaultDir=path.join(playerVisibleXlsxRoot(project.workspace,base),'xlsx');
+    const picked=await dialog.showOpenDialog(win,{title:'选择逐文件 XLSX 或多 PAK 未翻译 XLSX 文件夹',defaultPath:defaultDir,properties:['openDirectory']});
     if(picked.canceled || !picked.filePaths.length) return {ok:false,canceled:true};
-    const xlsxPath=picked.filePaths[0];
-    ollamaControlPath=path.join(defaultDir,'ollama_control.json');
-    fs.mkdirSync(defaultDir,{recursive:true});
+    const folderPath=picked.filePaths[0];
+    const adjacentConfig=path.join(path.dirname(folderPath),'config');
+    const projectConfig=path.join(playerVisibleXlsxRoot(project.workspace,base),'config');
+    const configDir=fs.existsSync(adjacentConfig)?adjacentConfig:(fs.existsSync(projectConfig)?projectConfig:folderPath);
+    let multiTarget=null;
+    let glossaryTarget=null;
+    for(const name of fs.readdirSync(folderPath).filter(name=>/_localization\.xlsx$/i.test(name)&&!name.endsWith('.bak')).sort()) {
+      const workbook=path.join(folderPath,name);
+      const mapping=path.join(configDir,`${path.basename(name,'.xlsx')}_mapping.json`);
+      if(!fs.existsSync(mapping)) continue;
+      try {
+        const meta=JSON.parse(fs.readFileSync(mapping,'utf8').replace(/^\uFEFF/,''));
+        if(meta.mode==='multi-pak-out-of-band-skeleton'&&Number(meta.version)===7) {
+          multiTarget={workbook,mapping,meta};
+          break;
+        }
+        if(meta.mode==='multi-pak-safe-term-glossary'&&Number(meta.version)===1) {
+          glossaryTarget={workbook,mapping,meta};
+        }
+      } catch {}
+    }
+    ollamaControlPath=path.join(configDir,'ollama_control.json');
+    fs.mkdirSync(configDir,{recursive:true});
     fs.writeFileSync(ollamaControlPath,JSON.stringify({stop:false,think:!!think}));
-    const args=['ollama-translate',project.workspace,pak];
-    const normalizedMaxBuckets=Number.isFinite(Number(maxBuckets))&&Number(maxBuckets)>0?Number(maxBuckets):0;
+    const args=['ollama-translate-folder',project.workspace,multiTarget?'all-paks':fallbackPak,folderPath];
     const normalizedBucketSize=Number.isFinite(Number(bucketSize))&&Number(bucketSize)>0?Math.min(500,Math.max(1,Number(bucketSize))):25;
-    args.push(String(normalizedMaxBuckets),String(normalizedBucketSize));
-    args.push(xlsxPath);
-    args.push(ollamaControlPath);
+    args.push(String(normalizedBucketSize),ollamaControlPath,configDir);
     const res=await runCli(args);
     if(!res.ok) return res;
-    // Live Ollama output is preview-only. Commit translations exclusively via
-    // the XLSX importer so altered placeholders are restored and validated.
-    const imported=await runCli(['import-untranslated-xlsx',project.workspace,pak,xlsxPath]);
+    const recordsPath=path.join(project.workspace,'localization','text_records.json');
+    if(glossaryTarget && !multiTarget) {
+      skipNextPersistAfterOllama=true;
+      return {ok:true,glossaryOnly:true,report:res.report,stopped:!!res.report?.stopped,folder:folderPath,configFolder:configDir,xlsxPath:glossaryTarget.workbook,mappingJson:glossaryTarget.mapping,records:readRecords(project.workspace)};
+    }
+    if(multiTarget) {
+      const imported=await runCli(['apply-xlsx-multi-records',recordsPath,multiTarget.workbook,multiTarget.mapping]);
+      if(!imported.ok) return imported;
+      const syncs=[];
+      let autoRejected=0;
+      for(const pakName of imported.report?.paks||[]) {
+        const sync=await syncRecordsWithAutoReject(project,pakName);
+        syncs.push({pak:pakName,...sync.report,outputDir:sync.outputDir});
+        autoRejected+=Number(sync.autoRejected||0);
+        if(Number(sync.report?.skipped_count||0)>0) {
+          return {ok:false,error:`${pakName} 自动恢复后仍有 ${sync.report.skipped_count} 条结构错误，已停止资源同步。`,report:res.report,importReport:imported.report,records:readRecords(project.workspace)};
+        }
+      }
+      const aggregate={
+        modified_records:syncs.reduce((n,x)=>n+Number(x.modified_records||0),0),
+        changed_file_count:syncs.reduce((n,x)=>n+Number(x.changed_file_count||0),0),
+        skipped_count:syncs.reduce((n,x)=>n+Number(x.skipped_count||0),0),
+      };
+      const exportDir=multiPakXlsxRoot(project.workspace);
+      const remaining=await runCli(['export-xlsx-multi-remaining',recordsPath,path.join(exportDir,'remaining_xlsx'),'all_paks_player_visible_remaining',path.join(exportDir,'config'),...(imported.report?.paks||[])]);
+      if(!remaining.ok) return {ok:false,error:`Ollama 译文已经安全导入，但重新生成残留 XLSX 失败：${remaining.error||'未知错误'}`,report:res.report,importReport:imported.report,records:readRecords(project.workspace)};
+      skipNextPersistAfterOllama=true;
+      return {ok:true,multiPak:true,report:res.report,stopped:!!res.report?.stopped,importReport:imported.report,records:readRecords(project.workspace),resourceSync:{report:aggregate},syncs,autoRejected,folder:folderPath,configFolder:configDir,remaining:remaining.report,remainingXlsx:remaining.report?.xlsx};
+    }
+    const imported=await runCli(['apply-xlsx-folder-records',recordsPath,folderPath,fallbackPak,configDir]);
     if(!imported.ok) return imported;
-    const sync=await syncRecordsToResources(project,pak);
-    const exported=await runCli(['export-untranslated-xlsx',project.workspace,pak]);
-    if(!exported.ok) return exported;
+    if(Number(imported.report?.failed_files||0)>0) {
+      return {ok:false,error:`Ollama 已保存部分成果，但导回只有 ${imported.report.imported_files||0}/${imported.report.total_files||0} 个文件成功。已停止资源同步。`,report:res.report,importReport:imported.report,records:readRecords(project.workspace)};
+    }
+    const sync=await syncRecordsWithAutoReject(project,fallbackPak);
+    const importedChanges=Number(imported.report?.changed||0);
+    const materialized=Number(sync?.report?.modified_records||0);
+    const changedFiles=Number(sync?.report?.changed_file_count||0);
+    const skipped=Number(sync?.report?.skipped_count||0);
+    if(skipped>0 || (importedChanges>0 && (materialized===0 || changedFiles===0))) {
+      return {ok:false,error:`Ollama 译文已保存，但资源回写未完整通过：译文变化 ${importedChanges} 条，生成资源 ${changedFiles} 个，跳过 ${skipped} 条。已阻止显示为完成。`,report:res.report,importReport:imported.report,resourceSync:sync,records:readRecords(project.workspace)};
+    }
     skipNextPersistAfterOllama=true;
     return {
       ok:true,
       report:res.report,
       stopped:!!res.report?.stopped,
       importReport:imported.report,
-      untranslatedReport:exported.report,
       records:readRecords(project.workspace),
       resourceSync:sync,
+      autoRejected:sync.autoRejected||0,
+      folder:folderPath,
+      configFolder:configDir,
     };
   } catch(e){ return {ok:false,error:e.message}; }
   finally { ollamaControlPath=null; }

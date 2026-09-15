@@ -61,9 +61,10 @@ def is_visible_ini_key(key:str)->bool:
     value=re.sub(r'(?<=[a-z0-9])(?=[A-Z])','_',raw).lower()
     if not value or INTERNAL_INI_KEY_RE.search(value):
         return False
-    # Visible labels often live under structural-looking names such as
-    # durability_v / requirelevel / requireseries. Resource-reference and
-    # natural-language checks below still exclude paths and internal values.
+    # Keys such as durability_v / requirelevel / requireseries own visible
+    # labels even though the key itself does not say text/title/name. Natural
+    # text and resource-reference checks run afterwards, so accept every
+    # non-structural INI key here and decide from its value.
     return True
 TCVN_MAP={128:'À',129:'Ả',130:'Ã',131:'Á',132:'Ạ',133:'Ặ',134:'Ậ',135:'È',136:'Ẻ',137:'Ẽ',138:'É',139:'Ẹ',140:'Ệ',141:'Ì',142:'Ỉ',143:'Ĩ',144:'Í',145:'Ị',146:'Ò',147:'Ỏ',148:'Õ',149:'Ó',150:'Ọ',151:'Ộ',152:'Ờ',153:'Ở',154:'Ỡ',155:'Ớ',156:'Ợ',157:'Ù',158:'Ủ',159:'Ũ',161:'Ă',162:'Â',163:'Ê',164:'Ô',165:'Ơ',166:'Ư',167:'Đ',168:'ă',169:'â',170:'ê',171:'ô',172:'ơ',173:'ư',174:'đ',175:'Ằ',176:'̀',177:'̉',178:'̃',179:'́',180:'̣',181:'à',182:'ả',183:'ã',184:'á',185:'ạ',186:'Ẳ',187:'ằ',188:'ẳ',189:'ẵ',190:'ắ',191:'Ẵ',192:'Ắ',193:'Ầ',194:'Ẩ',195:'Ẫ',196:'Ấ',197:'Ề',198:'ặ',199:'ầ',200:'ẩ',201:'ẫ',202:'ấ',203:'ậ',204:'è',205:'Ể',206:'ẻ',207:'ẽ',208:'é',209:'ẹ',210:'ề',211:'ể',212:'ễ',213:'ế',214:'ệ',215:'ì',216:'ỉ',217:'Ễ',218:'Ế',219:'Ồ',220:'ĩ',221:'í',222:'ị',223:'ò',224:'Ổ',225:'ỏ',226:'õ',227:'ó',228:'ọ',229:'ồ',230:'ổ',231:'ỗ',232:'ố',233:'ộ',234:'ờ',235:'ở',236:'ỡ',237:'ớ',238:'ợ',239:'ù',240:'Ỗ',241:'ủ',242:'ũ',243:'ú',244:'ụ',245:'ừ',246:'ử',247:'ữ',248:'ứ',249:'ự',250:'ỳ',251:'ỷ',252:'ỹ',254:'ỵ',255:'Ố'}
 VI_CHARS=set('ăâđêôơưĂÂĐÊÔƠƯàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵÀẢÃÁẠẰẲẴẮẶẦẨẪẤẬÈẺẼÉẸỀỂỄẾỆÌỈĨÍỊÒỎÕÓỌỒỔỖỐỘỜỞỠỚỢÙỦŨÚỤỪỬỮỨỰỲỶỸÝỴ')
@@ -82,6 +83,65 @@ VISIBLE_TSV_HEADER_RE=re.compile(r'(?:^|_)(?:npc_?name|name|title|text|string|in
 INTERNAL_TSV_HEADER_RE=re.compile(r'(?:^|_)(?:id|res(?:ource)?|idx|index|code|path|file|image|icon|spr|anim(?:ation)?|script|function|param|value|type|kind|genre|detail|particular|level|map|width|height|price|count|weight|quantity|series|option|flag|time|lock|trade|drop|x|y|z|skill\d+)(?:$|_)|(?:资源|动画|文件|路径|索引|编号|种类|类别|类型|数值|最小值|最大值|属性|价格|等级|宽度|高度|负重|标记|时间|是否|装备id|套装id|resid)|技能\d+',re.I)
 INTERNAL_INI_KEY_RE=re.compile(r'(?:^|_)(?:id|res(?:ource)?|idx|index|code|path|file|image|icon|spr|anim(?:ation)?|script|function|param|value|type|kind|level|map|width|height|x|y|z|color|font|sound|music|offset|frame|count|time|flag)(?:$|_)',re.I)
 RESOURCE_EXTS=('spr','bmp','png','jpg','jpeg','gif','dds','tga','wav','mp3','ogg','mid','ani','cur','ico','ttf','fnt','ini','lua','txt','tsv','csv','xml','json','pak','dat','bin')
+
+# Text that is embedded data/code, not a player-facing sentence.  This guard
+# deliberately runs after decoding but before a record is admitted to the
+# translation allowlist.  A natural-language fragment inside JSON or a game
+# control expression must never make the whole payload translatable.
+STRUCTURAL_TEXT_RE = re.compile(
+    r"(?:^\s*\{.*\}\s*$)"
+    r"|(?:\]\s*\*\*\s*[{}]|\*\*\s*[{}])"
+    r"|(?:^\s*(?:px\)\s*)?\{.*\}\s*$)"
+    r"|(?:\b(?:function|local|return|elseif|then|end)\b\s*[^\n]*[=(){};])",
+    re.I | re.S,
+)
+
+# These are not player strings even when an old extractor classified them as
+# text.  CSS is embedded in a few TXT/LUA resources and is executable layout
+# data.  Game rich-text tags are handled later by the XLSX skeleton splitter:
+# tags stay out of the worksheet while their visible inner text can be translated.
+STYLESHEET_DIRECTIVE_RE = re.compile(r"^\s*@(?:media|keyframes|font-face|supports|import|charset)\b", re.I)
+STYLESHEET_DECLARATION_RE = re.compile(
+    r"^\s*(?:(?:align-content|align-items|align-self|background(?:-[\w-]+)?|border(?:-[\w-]+)?|"
+    r"bottom|clear|color|column(?:-[\w-]+)?|display|float|font(?:-[\w-]+)?|height|left|"
+    r"line-height|margin(?:-[\w-]+)?|max-(?:width|height)|min-(?:width|height)|opacity|overflow(?:-[\w-]+)?|"
+    r"padding(?:-[\w-]+)?|position|right|text-align|text-decoration|text-shadow|top|transform|"
+    r"vertical-align|visibility|white-space|width|z-index)\s*:\s*[^{};]+;?\s*)+$",
+    re.I,
+)
+STYLESHEET_DECLARATION_PREFIX_RE = re.compile(
+    r"^\s*(?:align-content|align-items|align-self|background(?:-[\w-]+)?|border(?:-[\w-]+)?|"
+    r"bottom|clear|color|column(?:-[\w-]+)?|display|float|font(?:-[\w-]+)?|height|left|"
+    r"line-height|margin(?:-[\w-]+)?|max-(?:width|height)|min-(?:width|height)|opacity|overflow(?:-[\w-]+)?|"
+    r"padding(?:-[\w-]+)?|position|right|text-align|text-decoration|text-shadow|top|transform|"
+    r"vertical-align|visibility|white-space|width|z-index)\s*:",
+    re.I,
+)
+STYLESHEET_PROPERTY_NAME_RE = re.compile(
+    r"^\s*(?:align-content|align-items|align-self|background(?:-[\w-]+)?|border(?:-[\w-]+)?|"
+    r"bottom|clear|color|column(?:-[\w-]+)?|display|float|font(?:-[\w-]+)?|height|left|"
+    r"line-height|margin(?:-[\w-]+)?|max-(?:width|height)|min-(?:width|height)|opacity|overflow(?:-[\w-]+)?|"
+    r"padding(?:-[\w-]+)?|position|right|text-align|text-decoration|text-shadow|top|transform|"
+    r"vertical-align|visibility|white-space|width|z-index)\s*$",
+    re.I,
+)
+MOJIBAKE_PREFIX_RE = re.compile(r"^\s*(?:Ă|Ã|Â|Ä|Å|Æ){2,}")
+
+def is_structural_translation_payload(text:str)->bool:
+    s=(text or '').strip()
+    if not s:
+        return False
+    if ('\ufffd' in s or MOJIBAKE_PREFIX_RE.match(s) or s.startswith('=')
+            or s.startswith('#') and len(s) > 1 and is_structural_translation_payload(s[1:])
+            or STYLESHEET_DIRECTIVE_RE.search(s)
+            or STYLESHEET_DECLARATION_RE.fullmatch(s) or STYLESHEET_DECLARATION_PREFIX_RE.match(s)
+            or STYLESHEET_PROPERTY_NAME_RE.fullmatch(s)
+            or s.startswith('@=') and s.count('@=') >= 2):
+        return True
+    # JSON/object/array payloads, including compact one-line dialogue tables.
+    if ((s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']'))) and (':' in s or '"' in s or "'" in s):
+        return True
+    return bool(STRUCTURAL_TEXT_RE.search(s))
 RESOURCE_KEYS={'image','spr','bkimage','smallbackimage','splitimage','pointimage','maleimage','femaleimage','imgfile_0','imgfile_1','imgfile_2','imgfile_3','imgfile_4','imgfile_5','captainflagimage_0','captainflagimage_1','captainflagimage_2','font','sound','music','texture','icon','filename','file','path'}
 MOJIBAKE_HINTS={'脿','峄','岷','霉','铆','啤','农','锚','谩','瓢','芒','膩','獜','牰','楜','瑩','浥','出来'}
 UTF8_LEGACY_MOJIBAKE_RE=re.compile(r'[ĂĐưƠƯÀ-ỹµÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ³»¼½¾¿]{4,}')
@@ -96,11 +156,21 @@ def encode_legacy_text(text:str)->bytes:
     text=str(text or '').replace('\u00a0',' ')
     rev={v:k for k,v in TCVN_MAP.items()}
     combining={'\u0300':176,'\u0309':177,'\u0303':178,'\u0301':179,'\u0323':180}
+    # TCVN3 stores Ư/ư as a base byte followed by the tone byte.  Python
+    # decomposes Ứ/Ừ/Ử/Ữ/Ự (and lowercase variants) into U/u + U+031B + tone,
+    # so handle that horn explicitly instead of rejecting otherwise valid UI
+    # translations.
+    horned_tones={
+        'Ứ':(166,179),'Ừ':(166,176),'Ử':(166,177),'Ữ':(166,178),'Ự':(166,180),
+        'ứ':(173,179),'ừ':(173,176),'ử':(173,177),'ữ':(173,178),'ự':(173,180),
+    }
     out=bytearray()
     for ch in str(text or ''):
         o=ord(ch)
         if o < 128:
             out.append(o); continue
+        if ch in horned_tones:
+            out.extend(horned_tones[ch]); continue
         if ch in rev:
             out.append(rev[ch]); continue
         if ch in VI_CHARS:
@@ -453,6 +523,8 @@ def likely_translatable(s:str,lang:str)->bool:
     if re.fullmatch(r'[\d\s.,:+\-*/%(){}\[\]_=<>\\/|]+',s): return False
     if re.fullmatch(r'[A-Za-z0-9_./\\:-]+',s) and lang=='other': return False
     low=' '+s.lower().strip('#$ ')+' '
+    if any(ch in VI_CHARS for ch in s) and bool(re.search(r'[A-Za-zÀ-ỹ]', s)):
+        return True
     vi_name_hint=sum(1 for w in active_vi_words() if w in low)>=1 and bool(re.search(r'[A-Za-zÀ-ỹ]',s))
     return lang in ('vi','zh','mixed') or vi_name_hint or any(k.lower() in s.lower() for k in ('task','skill','item','talk','message'))
 
@@ -504,7 +576,10 @@ def iter_units(path:Path):
 
 def is_candidate_bytes(b:bytes)->bool:
     s=b.strip()
-    if len(s)<2 or len(s)>4096: return False
+    # Excel accepts at most 32,767 characters in a cell.  The former 4 KiB
+    # scanner cap silently dropped legitimate long quest and story text.
+    # Keep the analysis limit aligned with the export format instead.
+    if len(s)<2 or len(s)>32767: return False
     # Fast-path: skip the huge volume of numeric/config cells before any codec work.
     if re.fullmatch(br'[0-9\s.,:+\-*/%(){}\[\]_=<>\\/|]+',s): return False
     if any(x>=128 for x in s): return True
@@ -533,6 +608,9 @@ def _analyze_one_file(args):
         if is_resource_reference_bytes(val_b,key_b):
             continue
         text,enc,lang,score=decode_best(val_b)
+        if is_structural_translation_payload(text):
+            stats['excluded_structural'] += 1
+            continue
         if text.strip().lower() in {'abc','test','测试','null','none','n/a'}: continue
         if is_resource_reference(text,key): continue
         if not has_editable_natural_text(text): continue
@@ -552,7 +630,11 @@ def _analyze_one_file(args):
         rec={
             'id':uid,'category':cat,'subcategory':sub,'pak':pak_name,'hash':h,'source_file':p.name,
             'line':lineno,'column':col,'key':key,'encoding':enc,'language':lang,'confidence_score':score,
-            'original':text,'translation':'','context':context[:1200],'status':'未翻译','note':''
+            'original':text,'translation':'','context':context[:1200],'status':'未翻译','note':'',
+            # Records are emitted only after the structure-aware TSV/INI/TXT/LUA
+            # filters above.  Persist that decision so the UI/export/import/build
+            # chain consumes one canonical scope instead of re-guessing it.
+            '_isPlayerVisible':True
         }
         records.append(rec); stats[cat]+=1; stats['lang_'+lang]+=1; stats['enc_'+enc]+=1
     return records,dict(stats)

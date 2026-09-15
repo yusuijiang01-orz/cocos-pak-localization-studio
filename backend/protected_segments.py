@@ -28,6 +28,8 @@ PATTERN = re.compile(
 NATURAL_LATIN_RE = re.compile(r'[A-Za-z\u00c0-\u024f\u1e00-\u1eff]')
 LATIN_RUN_RE = re.compile(r'[A-Za-z\u00c0-\u024f\u1e00-\u1eff]+')
 HAN_RE = re.compile(r'[\u3400-\u9fff]')
+PARTIAL_LEADING_STEM_RE = re.compile(r'^([A-Za-z]{1,3})(?=[\u3400-\u9fff])')
+TECH_ACRONYMS = {'NPC', 'PK', 'PVP', 'PVE', 'VIP', 'HP', 'MP', 'EXP', 'ID', 'UI', 'URL'}
 EXACT_TRANSLATIONS = {
     'Hoàn thành nhiệm vụ': '任务完成',
     'Hoàn thành nhiệm vụ.': '任务完成。',
@@ -37,14 +39,18 @@ EXACT_TRANSLATIONS = {
     'Phòng ngự tăng 180 điểm': '防御增加180点',
 }
 
-def split_rows(rows, compact=False):
+def split_rows(rows, compact=False, marker_style='diamond'):
     requests, layouts = [], {}
     for row in rows:
         text = str(row['text'])
         if compact:
             markers = {}
             def protect(match):
-                marker = f'◈{90000000 + len(markers)}◈'
+                marker = (
+                    f'<x{90000000 + len(markers)}/>'
+                    if marker_style == 'xml'
+                    else f'◈{90000000 + len(markers)}◈'
+                )
                 markers[marker] = match.group(0)
                 return marker
             masked = PATTERN.sub(protect, text)
@@ -96,6 +102,12 @@ def assemble(layouts, results):
         # never identifiers. Remove them before reattaching protected content.
         # Keep residual words intact so validation can retry instead of silently
         # deleting untranslated meaning.
+        # Some models keep the first one or two letters of a Vietnamese word
+        # and glue them to Chinese (K系统 / Ph附近). This is never a valid
+        # translation, while known game acronyms remain intact.
+        stem = PARTIAL_LEADING_STEM_RE.match(value)
+        if stem and stem.group(1).upper() not in TECH_ACRONYMS:
+            value = value[stem.end():]
         values[key] = value
     output = []
     for rid, layout in layouts.items():

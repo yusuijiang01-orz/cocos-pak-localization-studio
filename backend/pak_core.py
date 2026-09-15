@@ -182,6 +182,16 @@ def _extract_worker_init(pak_path:str,index_offset:int):
     _PAK_MM=mmap.mmap(_PAK_FH.fileno(),0,access=mmap.ACCESS_READ)
     _PAK_INDEX_OFFSET=index_offset
 
+def _close_worker_pak():
+    global _PAK_MM,_PAK_FH,_PAK_INDEX_OFFSET
+    if _PAK_MM is not None:
+        _PAK_MM.close()
+        _PAK_MM=None
+    if _PAK_FH is not None:
+        _PAK_FH.close()
+        _PAK_FH=None
+    _PAK_INDEX_OFFSET=0
+
 def _extract_entry_worker(task):
     i,hid,offset,real,packed,method,out_dir=task
     e={'index':i,'id_hash_hex':f'{hid:08X}','offset':offset,'real_length':real,'packed_length':packed,'method':method}
@@ -229,7 +239,10 @@ def extract_one(pak:Path, out_override:Path|None=None, workers:int|None=None):
     wc=worker_count(workers)
     if wc<=1 or count<24:
         _extract_worker_init(str(pak),index_offset)
-        entries=[_extract_entry_worker(t) for t in tasks]
+        try:
+            entries=[_extract_entry_worker(t) for t in tasks]
+        finally:
+            _close_worker_pak()
     else:
         with ProcessPoolExecutor(max_workers=wc,initializer=_extract_worker_init,initargs=(str(pak),index_offset)) as ex:
             # map preserves source index order, keeping manifests deterministic.
