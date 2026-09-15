@@ -1,4 +1,4 @@
-name: vNext Phase 1-5 tests
+name: vNext Phase 1-6 tests
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile vNext backend
         run: |
-          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py
+          python -m py_compile backend/vnext/*.py backend/vnext_cli.py backend/vnext_ui_cli.py backend/vnext_compat_cli.py
 
       - name: Phase 1 tests
         run: python backend/test_vnext_phase1.py
@@ -40,10 +40,22 @@ jobs:
       - name: Phase 5 tests
         run: python backend/test_vnext_phase5.py
 
-      - name: Phase 5 JavaScript syntax
+      - name: Phase 6 tests
+        run: python backend/test_vnext_phase6.py
+
+      - name: Phase 5-6 JavaScript syntax
         run: |
           node --check electron/main_vnext.js
           node --check electron/vnext_ipc.js
+          node --check electron/vnext_compat_ipc.js
           node --check electron/preload.js
           node --check renderer/vnext_ui.js
+          node --check renderer/vnext_compat_ui.js
           node --check renderer/glossary_translate_ui.js
+
+      - name: Renderer asset wiring
+        run: |
+          grep -q 'href="vnext.css"' renderer/index.html
+          grep -q 'href="vnext_compat.css"' renderer/index.html
+          grep -q 'src="vnext_ui.js"' renderer/index.html
+          grep -q 'src="vnext_compat_ui.js"' renderer/index.html
