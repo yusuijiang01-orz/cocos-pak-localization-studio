@@ -20,6 +20,16 @@ def _target_fingerprint(target: str) -> str:
     return sha256_text(value) if value else ""
 
 
+def is_target_blocked(db: sqlite3.Connection, unit_id: str, target: str) -> bool:
+    fingerprint = _target_fingerprint(target)
+    if not fingerprint:
+        return False
+    return db.execute(
+        "SELECT 1 FROM blocked_targets WHERE unit_id=? AND target_fingerprint=?",
+        (unit_id, fingerprint),
+    ).fetchone() is not None
+
+
 def _json_list(value: str) -> list[str]:
     try:
         parsed = json.loads(value or "[]")
@@ -134,7 +144,7 @@ def sync_review_queue(
     project_db_path: Path,
     knowledge_db_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Rebuild the risk queue without disturbing already reviewed identical targets."""
+    """Refresh the risk queue without reopening an unchanged human-approved target."""
     project = init_project_db(Path(project_db_path))
     knowledge = init_knowledge_db(Path(knowledge_db_path or default_knowledge_db()))
     stats = {"queued": 0, "pending": 0, "deferred": 0, "approved": 0, "rejected": 0, "resolved": 0}
@@ -157,7 +167,6 @@ def sync_review_queue(
             target = str(current["target_text"] if current else "")
             fingerprint = _target_fingerprint(target)
 
-            # A human-approved/locked target with the same snapshot stays resolved.
             if (
                 existing
                 and existing["state"] == "approved"
@@ -259,12 +268,15 @@ def list_review_items(
         clauses = ["1=1"]
         params: list[Any] = []
         if state and state != "all":
-            clauses.append("r.state=?"); params.append(state)
+            clauses.append("r.state=?")
+            params.append(state)
         if severity:
-            clauses.append("r.severity=?"); params.append(severity)
+            clauses.append("r.severity=?")
+            params.append(severity)
         if query:
             clauses.append("(u.source_text LIKE ? OR r.target_snapshot LIKE ? OR r.reason_code LIKE ?)")
-            needle = f"%{query}%"; params.extend((needle, needle, needle))
+            needle = f"%{query}%"
+            params.extend((needle, needle, needle))
         params.extend((max(1, int(limit)), max(0, int(offset))))
         rows = db.execute(
             f"""SELECT r.*,u.source_lang,u.unit_kind,u.word_count,u.risk_flags_json,
@@ -306,6 +318,9 @@ def review_detail(project_db_path: Path, unit_id: str) -> dict[str, Any]:
         actions = [dict(row) for row in db.execute(
             "SELECT * FROM review_actions WHERE unit_id=? ORDER BY action_id DESC LIMIT 50", (unit_id,)
         )]
+        blocked = [dict(row) for row in db.execute(
+            "SELECT * FROM blocked_targets WHERE unit_id=? ORDER BY created_at DESC", (unit_id,)
+        )]
         return {
             "unit": dict(unit),
             "target": dict(target) if target else None,
@@ -313,6 +328,7 @@ def review_detail(project_db_path: Path, unit_id: str) -> dict[str, Any]:
             "findings": findings,
             "occurrences": occurrences,
             "actions": actions,
+            "blocked_targets": blocked,
         }
     finally:
         db.close()
@@ -354,6 +370,7 @@ def approve_review(
             locked=lock,
             provenance=f"vnext-review:{unit_id}",
         )
+        knowledge.commit()
         now = utcnow()
         project.execute(
             """INSERT INTO current_targets(unit_id,target_text,target_status,origin,knowledge_ref,qa_status,locked,updated_at)
@@ -362,6 +379,10 @@ def approve_review(
                  origin=excluded.origin,knowledge_ref=excluded.knowledge_ref,qa_status='passed',locked=excluded.locked,
                  updated_at=excluded.updated_at""",
             (unit_id, target, quality, f"review:{quality}", str(tm_id), int(bool(lock)), now),
+        )
+        project.execute(
+            "DELETE FROM blocked_targets WHERE unit_id=? AND target_fingerprint=?",
+            (unit_id, _target_fingerprint(target)),
         )
         project.execute("UPDATE qa_findings SET resolved=1 WHERE unit_id=? AND resolved=0", (unit_id,))
         warning_codes = [f.code for f in findings if severity_rank(f.severity) == 1]
@@ -391,7 +412,14 @@ def approve_review(
             detail={"quality": quality, "locked": bool(lock), "warnings": warning_codes},
         )
         project.commit()
-        return {"ok": True, "unit_id": unit_id, "target": target, "quality": quality, "locked": bool(lock), "tm_id": tm_id}
+        return {
+            "ok": True,
+            "unit_id": unit_id,
+            "target": target,
+            "quality": quality,
+            "locked": bool(lock),
+            "tm_id": tm_id,
+        }
     finally:
         knowledge.close()
         project.close()
@@ -413,6 +441,14 @@ def reject_review(
         current = project.execute("SELECT * FROM current_targets WHERE unit_id=?", (unit_id,)).fetchone()
         before = str(current["target_text"] if current else "")
         knowledge_ref = str(current["knowledge_ref"] if current else "")
+        origin = str(current["origin"] if current else "")
+        if before:
+            project.execute(
+                """INSERT OR REPLACE INTO blocked_targets(
+                     unit_id,target_fingerprint,target_text,origin,note,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (unit_id, _target_fingerprint(before), before, origin, note, utcnow()),
+            )
         if current:
             project.execute(
                 """UPDATE current_targets SET target_status='rejected',qa_status='rejected',locked=0,
@@ -427,7 +463,7 @@ def reject_review(
             knowledge.commit()
         project.execute(
             """UPDATE job_items SET status='failed',last_error=?,updated_at=? WHERE unit_id=?""",
-            ("人工审核拒绝；允许重新翻译", utcnow(), unit_id),
+            ("人工审核拒绝；允许重新翻译，但禁止复用同一译文", utcnow(), unit_id),
         )
         _set_review_item(
             project,
@@ -444,9 +480,17 @@ def reject_review(
             ).fetchone()[0],
             note=note,
         )
-        _log_action(project, unit_id, "reject", before_target=before, after_target=before, note=note)
+        _log_action(
+            project,
+            unit_id,
+            "reject",
+            before_target=before,
+            after_target=before,
+            note=note,
+            detail={"blocked_fingerprint": _target_fingerprint(before) if before else ""},
+        )
         project.commit()
-        return {"ok": True, "unit_id": unit_id, "state": "rejected"}
+        return {"ok": True, "unit_id": unit_id, "state": "rejected", "blocked_target": bool(before)}
     finally:
         knowledge.close()
         project.close()
@@ -461,7 +505,14 @@ def set_review_state(project_db_path: Path, unit_id: str, state: str, *, note: s
         if not row:
             raise KeyError(f"Review item not found: {unit_id}")
         db.execute("UPDATE review_items SET state=?,note=?,updated_at=? WHERE unit_id=?", (state, note, utcnow(), unit_id))
-        _log_action(db, unit_id, state, before_target=row["target_snapshot"], after_target=row["target_snapshot"], note=note)
+        _log_action(
+            db,
+            unit_id,
+            state,
+            before_target=row["target_snapshot"],
+            after_target=row["target_snapshot"],
+            note=note,
+        )
         db.commit()
         return {"ok": True, "unit_id": unit_id, "state": state}
     finally:
@@ -484,12 +535,14 @@ def review_stats(project_db_path: Path) -> dict[str, Any]:
         rejected_targets = db.execute(
             "SELECT COUNT(*) FROM current_targets WHERE qa_status IN ('failed','rejected') OR target_status='rejected'"
         ).fetchone()[0]
+        blocked_targets = db.execute("SELECT COUNT(*) FROM blocked_targets").fetchone()[0]
         return {
             "by_state": by_state,
             "pending_by_severity": by_severity,
             "pending_by_reason": by_reason,
             "unresolved_qa": unresolved_qa,
             "rejected_targets": rejected_targets,
+            "blocked_targets": blocked_targets,
         }
     finally:
         db.close()
