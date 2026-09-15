@@ -159,3 +159,18 @@
     }
   };
 }());
+
+// Phase 5 is loaded after the legacy renderer so the old tools stay intact.
+(function loadVNextPhase5() {
+  if (document.getElementById('vnextPhase5Script')) return;
+  if (!document.querySelector('link[href="vnext.css"]')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'vnext.css';
+    document.head.appendChild(link);
+  }
+  const script = document.createElement('script');
+  script.id = 'vnextPhase5Script';
+  script.src = 'vnext_ui.js';
+  document.body.appendChild(script);
+}());
