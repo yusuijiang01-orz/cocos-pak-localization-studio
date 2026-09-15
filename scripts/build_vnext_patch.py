@@ -10,45 +10,62 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-PATCH_VERSION = "7.0.0-vnext"
-BASELINE_COMMIT = "cd196402f0681b4b8c105a1cef47bed42542a686"
+PATCH_VERSION = "7.0.1-vnext"
+BASELINE_COMMIT = "cd196402f0681b4f233395c5db32a1385510"
 PATCH_NAME = f"Cocos-PAK-Studio-vNext-{PATCH_VERSION}-Incremental-Patch"
 
-RUNTIME_FILES = [
+# The first 7.0.0 overlay only copied files changed by vNext itself. That was too
+# narrow for users whose local Studio predates intermediate legacy bootstrap
+# modules such as electron/main_with_glossary_resume.js. v7.0.1 is still an
+# incremental *runtime* overlay (not a full repository), but it is cumulative:
+# all runtime Python/JS/HTML/CSS entrypoints required by the current branch are
+# included, while tests, docs, CI metadata, workspaces and node_modules remain
+# excluded.
+ROOT_RUNTIME_FILES = [
     "package.json",
-    "backend/vnext/__init__.py",
-    "backend/vnext/build.py",
-    "backend/vnext/classify.py",
-    "backend/vnext/compatibility.py",
-    "backend/vnext/database.py",
-    "backend/vnext/ingest.py",
-    "backend/vnext/jobs.py",
-    "backend/vnext/knowledge.py",
-    "backend/vnext/models.py",
-    "backend/vnext/normalize.py",
-    "backend/vnext/ollama_engine.py",
-    "backend/vnext/phase7.py",
-    "backend/vnext/pipeline.py",
-    "backend/vnext/protection.py",
-    "backend/vnext/qa.py",
-    "backend/vnext/review.py",
-    "backend/vnext/ui_api.py",
-    "backend/vnext/workspace_ingest.py",
-    "backend/vnext_cli.py",
-    "backend/vnext_compat_cli.py",
-    "backend/vnext_phase7_cli.py",
-    "backend/vnext_ui_cli.py",
-    "electron/main_vnext.js",
-    "electron/preload.js",
-    "electron/vnext_compat_ipc.js",
-    "electron/vnext_ipc.js",
-    "renderer/glossary_translate_ui.js",
-    "renderer/index.html",
-    "renderer/vnext.css",
-    "renderer/vnext_compat.css",
-    "renderer/vnext_compat_ui.js",
-    "renderer/vnext_ui.js",
+    "START_V3A.bat",
+    "INSTALL_DEPS.bat",
 ]
+
+
+def collect_runtime_files(repo: Path) -> list[str]:
+    files: set[str] = set()
+    for rel in ROOT_RUNTIME_FILES:
+        if (repo / rel).is_file():
+            files.add(rel)
+
+    # Electron bootstrap/preload and renderer assets are all small and tightly
+    # coupled, so ship the complete runtime directories.
+    for folder, suffixes in (
+        ("electron", {".js", ".json"}),
+        ("renderer", {".js", ".css", ".html", ".json"}),
+    ):
+        root = repo / folder
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in suffixes:
+                files.add(path.relative_to(repo).as_posix())
+
+    # Backend runtime is dependency-rich. Include Python sources and small JSON
+    # configuration files, but never tests, caches or generated outputs.
+    backend = repo / "backend"
+    if backend.is_dir():
+        for path in backend.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(repo).as_posix()
+            parts = path.relative_to(backend).parts
+            if "__pycache__" in parts:
+                continue
+            name = path.name.lower()
+            if name.startswith("test_") or name.endswith("_test.py"):
+                continue
+            if path.suffix.lower() not in {".py", ".json"}:
+                continue
+            files.add(rel)
+
+    return sorted(files)
 
 
 def sha256(path: Path) -> str:
@@ -63,10 +80,30 @@ def main(argv: list[str]) -> int:
     repo = Path(argv[1] if len(argv) > 1 else ".").resolve()
     out_root = Path(argv[2] if len(argv) > 2 else repo / "dist-patch").resolve()
     source_commit = os.environ.get("PATCH_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA") or "unknown"
+    runtime_files = collect_runtime_files(repo)
 
-    missing = [rel for rel in RUNTIME_FILES if not (repo / rel).is_file()]
-    if missing:
-        raise SystemExit("Patch source missing files: " + ", ".join(missing))
+    required = {
+        "package.json",
+        "electron/main.js",
+        "electron/main_vnext.js",
+        "electron/main_with_glossary.js",
+        "electron/main_with_glossary_resume.js",
+        "electron/preload.js",
+        "electron/vnext_ipc.js",
+        "electron/vnext_compat_ipc.js",
+        "backend/studio_cli.py",
+        "backend/glossary_xlsx_translate.py",
+        "backend/glossary_xlsx_translate_resumable.py",
+        "backend/xlsx_localization.py",
+        "backend/pak_builder.py",
+        "backend/pak_core.py",
+        "backend/vnext/pipeline.py",
+        "renderer/index.html",
+        "renderer/vnext_ui.js",
+    }
+    missing_required = sorted(required - set(runtime_files))
+    if missing_required:
+        raise SystemExit("Patch source missing required runtime files: " + ", ".join(missing_required))
 
     stage = out_root / PATCH_NAME
     if stage.exists():
@@ -74,7 +111,7 @@ def main(argv: list[str]) -> int:
     stage.mkdir(parents=True, exist_ok=True)
 
     files = []
-    for rel in RUNTIME_FILES:
+    for rel in runtime_files:
         src = repo / rel
         dst = stage / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -91,17 +128,24 @@ def main(argv: list[str]) -> int:
         "baseline_commit": BASELINE_COMMIT,
         "source_commit": source_commit,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "install_mode": "overlay-replace",
+        "install_mode": "cumulative-runtime-overlay-replace",
         "database_schema": 2,
         "core_version": "0.7.0",
         "files": files,
         "excluded": [
             "node_modules/",
             ".git/",
+            ".github/",
+            "docs/",
+            "tests and test_*.py",
+            "__pycache__/",
             "workspace/ and user project data",
             "PAK files",
-            "tests and CI-only files",
         ],
+        "compatibility": {
+            "older_local_baselines": "supported by cumulative runtime overlay",
+            "startup_fallback": "main_with_glossary_resume -> main_with_glossary -> main",
+        },
         "validation": {
             "phase_1_to_7_ci": "required before artifact publication",
             "windows_electron_smoke": "required before artifact publication",
@@ -112,7 +156,7 @@ def main(argv: list[str]) -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    instructions = f"""Cocos PAK Localization Studio vNext 增量补丁\n\n版本：{PATCH_VERSION}\n目标基线：{BASELINE_COMMIT}\n\n安装：\n1. 完全退出 Studio。\n2. 先备份你当前的项目代码目录。\n3. 将本压缩包内 {PATCH_NAME} 文件夹中的内容复制到 Studio 项目根目录。\n4. Windows 提示时选择“替换目标中的文件”。\n5. 不要删除 node_modules，也不要覆盖/删除你的 workspace、原始 PAK、localization 数据。\n6. 启动原来的根目录启动脚本，或执行 npm start。\n\n首次进入 vNext：\n- 先打开原有项目。\n- 在“旧版工具”区域检查兼容状态。\n- 如果工作区显示未同步，先执行“仅同步源索引”；如果你要保留旧版已翻译中文，则执行“吸收旧版当前译文”。\n- 新翻译优先使用“智能翻译”，新 PAK 使用“构建”页的 vNext Build Gate。\n\n重要：\n- 这是增量覆盖补丁，不包含完整项目和 node_modules。\n- 自动 CI 已通过 Phase 1–7、Windows 三 PACK 构建链路和 Electron 主入口启动验证。\n- 因尚未取得你的真实原版 settings.pak/updatefs.pak/ui.pak 与游戏客户端，本补丁尚未完成真实游戏运行不闪退的最终签字验证。首次用于正式游戏前请保留原始 PAK 备份。\n"""
+    instructions = f"""Cocos PAK Localization Studio vNext 累计增量补丁\n\n版本：{PATCH_VERSION}\n目标参考基线：{BASELINE_COMMIT}\n\n这是 7.0.0 的兼容修正版。7.0.0 只打包了 vNext 自身变更文件，在较老的本地 Studio（例如早期 v3a-hotfix）上可能缺少 main_with_glossary_resume.js 等中间运行模块，导致 Electron 启动时报 Cannot find module。7.0.1 改为累计运行时覆盖包，仍不包含完整仓库、测试、文档或 node_modules。\n\n安装：\n1. 完全退出 Studio。\n2. 备份当前 Studio 代码目录。\n3. 将本压缩包内 {PATCH_NAME} 文件夹中的内容复制到 Studio 项目根目录。\n4. Windows 提示时选择“替换目标中的文件”。\n5. 不要删除 node_modules，也不要覆盖/删除你的 workspace、原始 PAK、localization 数据。\n6. 启动原来的根目录启动脚本，或执行 npm start。\n\n首次进入 vNext：\n- 先打开原有项目。\n- 在“旧版工具”区域检查兼容状态。\n- 如果工作区显示未同步，先执行“仅同步源索引”；如果要保留旧版已翻译中文，则执行“吸收旧版当前译文”。\n- 新翻译优先使用“智能翻译”，新 PAK 使用“构建”页的 vNext Build Gate。\n\n重要：\n- 这是累计增量运行时补丁，不包含 node_modules、Git、测试、文档、用户 workspace 或 PAK。\n- 自动 CI 必须通过 Phase 1–7、Windows 三 PACK 构建链路和 Electron 主入口启动验证后才会发布。\n- 尚未取得你的真实原版 settings.pak/updatefs.pak/ui.pak 与游戏客户端，因此真实游戏运行不闪退仍需首次实机验证；请保留原始 PAK 备份。\n"""
     (stage / "补丁说明.txt").write_text(instructions, encoding="utf-8-sig")
 
     zip_path = out_root / f"{PATCH_NAME}.zip"
