@@ -11,6 +11,7 @@ from .normalize import normalize_source, normalized_lookup_key, source_key
 
 
 TRUSTED_TM_QUALITIES = ("manual", "approved", "reviewed", "reference", "seed")
+_GLOSSARY_INDEX_CACHE: dict[int, "GlossaryIndex"] = {}
 
 
 def lookup_trusted_tm(db: sqlite3.Connection, source_text: str, target_lang: str = "zh-CN"):
@@ -175,15 +176,28 @@ def glossary_hash(db: sqlite3.Connection) -> str:
     return GlossaryIndex.from_db(db).fingerprint
 
 
+def invalidate_glossary_index(db: sqlite3.Connection | None = None) -> None:
+    if db is None:
+        _GLOSSARY_INDEX_CACHE.clear()
+    else:
+        _GLOSSARY_INDEX_CACHE.pop(id(db), None)
+
+
 def relevant_glossary_terms(
     db: sqlite3.Connection,
     source_text: str,
     *,
     limit: int = 24,
 ) -> list[dict[str, Any]]:
-    # Compatibility helper. Hot translation paths should build one GlossaryIndex
-    # and reuse it for all units.
-    return GlossaryIndex.from_db(db).find(source_text, limit=limit)
+    # Build the Aho-Corasick automaton once per open knowledge DB connection.
+    # CLI translation owns one connection for the whole job, so matching tens
+    # of thousands of units remains O(total source text + matches).
+    key = id(db)
+    index = _GLOSSARY_INDEX_CACHE.get(key)
+    if index is None:
+        index = GlossaryIndex.from_db(db)
+        _GLOSSARY_INDEX_CACHE[key] = index
+    return index.find(source_text, limit=limit)
 
 
 def context_hash(context: Any) -> str:
