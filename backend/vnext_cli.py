@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
+from vnext.build import build_history, build_verified_paks, preflight_build
 from vnext.database import default_knowledge_db, init_knowledge_db, init_project_db, migrate_legacy_tm
 from vnext.ingest import ingest_full_xlsx, project_stats
 from vnext.jobs import job_summary, latest_job
@@ -19,6 +20,7 @@ from vnext.review import (
     set_review_state,
     sync_review_queue,
 )
+from vnext.workspace_ingest import ingest_workspace_records
 
 
 def emit(value, *, compact: bool = False):
@@ -44,6 +46,10 @@ def main() -> int:
     p_ingest.add_argument("--workspace", required=True)
     p_ingest.add_argument("--xlsx", required=True)
     p_ingest.add_argument("--project-name", default="Imported localization")
+
+    p_ingest_ws = sub.add_parser("ingest-workspace", help="ingest live Studio records with out-of-band protected skeletons")
+    p_ingest_ws.add_argument("--workspace", required=True)
+    p_ingest_ws.add_argument("--project-name", default="")
 
     p_stats = sub.add_parser("stats", help="show vNext project unit statistics")
     p_stats.add_argument("--workspace", required=True)
@@ -117,6 +123,25 @@ def main() -> int:
     p_review_stats.add_argument("--knowledge-db", default="")
     p_review_stats.add_argument("--sync", action="store_true")
 
+    p_build_preflight = sub.add_parser("build-preflight", help="run final vNext QA/review gate without touching resources")
+    p_build_preflight.add_argument("--workspace", required=True)
+    p_build_preflight.add_argument("--knowledge-db", default="")
+    p_build_preflight.add_argument("--require-translated", action="store_true")
+    p_build_preflight.add_argument("--fail-on-warnings", action="store_true")
+
+    p_build = sub.add_parser("build-paks", help="materialize, rebuild and re-extract-verify selected PAKs")
+    p_build.add_argument("--workspace", required=True)
+    p_build.add_argument("--knowledge-db", default="")
+    p_build.add_argument("--output-dir", default="")
+    p_build.add_argument("--pak", action="append", default=[])
+    p_build.add_argument("--workers", type=int, default=1)
+    p_build.add_argument("--require-translated", action="store_true")
+    p_build.add_argument("--fail-on-warnings", action="store_true")
+
+    p_build_history = sub.add_parser("build-history", help="show vNext verified/failed build snapshots")
+    p_build_history.add_argument("--workspace", required=True)
+    p_build_history.add_argument("--limit", type=int, default=20)
+
     args = parser.parse_args()
     workspace = Path(getattr(args, "workspace", ".")).resolve()
     project_db = workspace / "vnext" / "project.sqlite3"
@@ -132,6 +157,11 @@ def main() -> int:
         if args.command == "ingest-xlsx":
             report = ingest_full_xlsx(Path(args.xlsx).resolve(), project_db, project_name=args.project_name)
             emit({"ok": True, "project_db": str(project_db), "report": report})
+            return 0
+
+        if args.command == "ingest-workspace":
+            report = ingest_workspace_records(workspace, project_db, project_name=args.project_name)
+            emit({"ok": True, "report": report})
             return 0
 
         if args.command == "stats":
@@ -248,6 +278,35 @@ def main() -> int:
             if args.sync:
                 sync_review_queue(project_db, _knowledge_path(args.knowledge_db))
             emit({"ok": True, "report": review_stats(project_db)})
+            return 0
+
+        if args.command == "build-preflight":
+            report = preflight_build(
+                project_db,
+                _knowledge_path(args.knowledge_db),
+                require_translated=args.require_translated,
+                fail_on_warnings=args.fail_on_warnings,
+            )
+            emit({"ok": report.get("ok", False), "report": report})
+            return 0 if report.get("ok") else 1
+
+        if args.command == "build-paks":
+            output_dir = Path(args.output_dir).resolve() if args.output_dir else None
+            report = build_verified_paks(
+                workspace,
+                project_db_path=project_db,
+                knowledge_db_path=_knowledge_path(args.knowledge_db),
+                output_dir=output_dir,
+                pak_names=args.pak or None,
+                workers=max(1, args.workers),
+                require_translated=args.require_translated,
+                fail_on_warnings=args.fail_on_warnings,
+            )
+            emit(report)
+            return 0
+
+        if args.command == "build-history":
+            emit({"ok": True, "items": build_history(project_db, max(1, args.limit))})
             return 0
 
         return 2
