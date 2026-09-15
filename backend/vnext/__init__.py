@@ -5,7 +5,7 @@ package replaces the current Electron translation/build path until a later
 migration phase explicitly opts into it.
 """
 SCHEMA_VERSION = 2
-CORE_VERSION = "0.3.0"
+CORE_VERSION = "0.4.0"
 
 from .models import SourceLanguage, UnitKind, TargetStatus, QASeverity
 from .normalize import normalize_source, source_key, stable_id
