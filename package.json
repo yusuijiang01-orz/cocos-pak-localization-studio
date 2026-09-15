@@ -1,8 +1,8 @@
 {
   "name": "cocos-pak-localization-studio-file-queue",
-  "version": "4.0.0",
-  "description": "按文件队列翻译的 Cocos2D / Kingsoft PACK 本地化 Studio",
-  "main": "electron/main_with_glossary_resume.js",
+  "version": "5.0.0-dev",
+  "description": "Cocos2D / Kingsoft PACK localization Studio with vNext incremental translation workflow",
+  "main": "electron/main_vnext.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron ."
