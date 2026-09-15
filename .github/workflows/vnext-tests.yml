@@ -1,0 +1,38 @@
+name: vNext backend tests
+
+on:
+  push:
+    branches:
+      - studio-vnext-phase1-core
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  vnext-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile vNext backend
+        run: |
+          python -m py_compile backend/vnext/*.py backend/vnext_cli.py
+
+      - name: Phase 1 tests
+        run: python backend/test_vnext_phase1.py
+
+      - name: Phase 2 tests
+        run: python backend/test_vnext_phase2.py
+
+      - name: Phase 3 tests
+        run: python backend/test_vnext_phase3.py
+
+      - name: Phase 4 tests
+        run: python backend/test_vnext_phase4.py
