@@ -8,8 +8,8 @@ from typing import Any
 from localization_analyzer import is_structural_translation_payload
 
 from .classify import classify_source
-from .database import add_occurrence, ensure_project, init_project_db, upsert_unit
-from .normalize import normalize_source, sha256_text
+from .database import add_occurrence, ensure_project, init_project_db, upsert_unit, utcnow
+from .normalize import file_fingerprint, normalize_source, sha256_text
 from .protection import split_runtime_text
 
 
@@ -54,12 +54,17 @@ def ingest_workspace_records(
 
     Protected syntax remains outside translation units. Every occurrence stores the same
     complete skeleton for its record, allowing deterministic reconstruction later.
+    The exact text_records.json byte fingerprint is persisted as the compatibility
+    boundary: if a legacy tool modifies that cache afterwards, vNext build is stale until
+    the user explicitly synchronizes or adopts the legacy state again.
     """
     workspace = Path(workspace).resolve()
     records_path = workspace / "localization" / "text_records.json"
     if not records_path.is_file():
         raise FileNotFoundError(f"缺少工作区记录：{records_path}")
-    records = json.loads(records_path.read_text(encoding="utf-8"))
+    raw_records = records_path.read_bytes()
+    records_digest = file_fingerprint(raw_records)
+    records = json.loads(raw_records.decode("utf-8-sig"))
     if not isinstance(records, list):
         raise ValueError("text_records.json 不是记录数组")
 
@@ -136,6 +141,10 @@ def ingest_workspace_records(
                 counts[f"language:{candidate.language.value}"] += 1
                 counts[f"kind:{candidate.kind.value}"] += 1
 
+        synced_at = utcnow()
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('workspace_records_sha256',?)", (records_digest,))
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('workspace_records_path',?)", (str(records_path),))
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('workspace_records_synced_at',?)", (synced_at,))
         db.commit()
         active = db.execute(
             "SELECT COUNT(*) FROM occurrences WHERE project_id=? AND active=1", (pid,)
@@ -153,6 +162,8 @@ def ingest_workspace_records(
             "active_unique_units": int(units),
             "stale_occurrences": int(stale),
             "counts": dict(sorted(counts.items())),
+            "records_sha256": records_digest,
+            "synced_at": synced_at,
             "project_db": str(db_path),
         }
     finally:
