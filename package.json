@@ -1,6 +1,6 @@
 {
   "name": "cocos-pak-localization-studio-file-queue",
-  "version": "7.0.0-dev",
+  "version": "7.0.1-dev",
   "description": "Cocos2D / Kingsoft PACK localization Studio with vNext incremental translation workflow",
   "main": "electron/main_vnext.js",
   "scripts": {
