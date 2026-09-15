@@ -23,12 +23,14 @@ from .knowledge import (
     lookup_trusted_tm,
     put_model_cache,
     relevant_glossary_terms,
+    terms_hash,
 )
 from .qa import evaluate_translation, is_build_safe
 
 
 EventCallback = Callable[[dict[str, Any]], None]
 AUTO_KINDS = ("ui_short", "sentence", "proper_noun", "mixed_source", "unknown")
+AUTHORITATIVE_TARGET_STATUSES = ("manual", "approved", "tm", "reference")
 
 
 def _noop(_: dict[str, Any]) -> None:
@@ -185,8 +187,13 @@ def _safe_apply(
     origin: str,
     knowledge_ref: str = "",
     locked: bool = False,
+    required_terms: list[dict[str, Any]] | None = None,
 ) -> bool:
-    findings = evaluate_translation(unit["source_text"], target)
+    findings = evaluate_translation(
+        unit["source_text"],
+        target,
+        required_terms=required_terms,
+    )
     _save_findings(project_db, unit["unit_id"], findings)
     safe = is_build_safe(findings)
     _set_target(
@@ -202,6 +209,34 @@ def _safe_apply(
     return safe
 
 
+def _merge_terms(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        for term in item.get("terminology") or []:
+            merged[(term["source"], term["target"])] = term
+    return list(merged.values())
+
+
+def _translate_resilient(
+    translator,
+    items: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Translate a batch, recursively isolating rows that break model JSON output."""
+    if not items:
+        return {}, {}
+    try:
+        return translator.translate_batch(items, _merge_terms(items)), {}
+    except Exception as exc:
+        if len(items) == 1:
+            return {}, {str(items[0]["id"]): str(exc)}
+        mid = max(1, len(items) // 2)
+        left_values, left_errors = _translate_resilient(translator, items[:mid])
+        right_values, right_errors = _translate_resilient(translator, items[mid:])
+        left_values.update(right_values)
+        left_errors.update(right_errors)
+        return left_values, left_errors
+
+
 def run_pipeline(
     project_db_path: Path,
     *,
@@ -215,14 +250,14 @@ def run_pipeline(
     project_db = init_project_db(Path(project_db_path))
     knowledge_db = init_knowledge_db(Path(knowledge_db_path or default_knowledge_db()))
     units = _candidate_units(project_db, max_units=max_units)
-    gh = glossary_hash(knowledge_db)
+    global_glossary_hash = glossary_hash(knowledge_db)
     job_id = start_or_resume_job(
         project_db,
         [row["unit_id"] for row in units],
         engine=translator.engine_name,
         model=translator.model,
         prompt_hash=translator.prompt_hash,
-        glossary_hash=gh,
+        glossary_hash=global_glossary_hash,
     )
     event(
         {
@@ -231,12 +266,15 @@ def run_pipeline(
             "job_id": job_id,
             "unique_units": len(units),
             "model": translator.model,
-            "glossary_hash": gh,
+            "glossary_hash": global_glossary_hash,
         }
     )
 
     try:
-        model_queue: list[tuple[sqlite3.Row, dict[str, Any], str]] = []
+        model_queue: list[
+            tuple[sqlite3.Row, dict[str, Any], str, list[dict[str, Any]], str]
+        ] = []
+
         for unit in units:
             if should_stop(project_db, job_id):
                 refresh_job_counts(project_db, job_id)
@@ -245,11 +283,25 @@ def run_pipeline(
                 event({"event": "stopped", "phase": "vnext-translate", **summary})
                 return summary
 
+            item_state = project_db.execute(
+                "SELECT status FROM job_items WHERE job_id=? AND unit_id=?",
+                (job_id, unit["unit_id"]),
+            ).fetchone()
+            if item_state and item_state["status"] == "rejected":
+                continue
+
             existing = project_db.execute(
                 "SELECT * FROM current_targets WHERE unit_id=?",
                 (unit["unit_id"],),
             ).fetchone()
-            if existing and existing["qa_status"] == "passed":
+            if (
+                existing
+                and existing["qa_status"] == "passed"
+                and (
+                    bool(existing["locked"])
+                    or existing["target_status"] in AUTHORITATIVE_TARGET_STATUSES
+                )
+            ):
                 mark_item(project_db, job_id, unit["unit_id"], "skipped")
                 continue
 
@@ -289,12 +341,15 @@ def run_pipeline(
 
             ctx = _context_for_unit(project_db, unit["unit_id"])
             ctx_hash = context_hash(ctx)
+            unit_terms = relevant_glossary_terms(knowledge_db, unit["source_text"])
+            unit_terms_hash = terms_hash(unit_terms)
+
             cached = lookup_model_cache(
                 knowledge_db,
                 unit["source_text"],
                 model=translator.model,
                 prompt_hash=translator.prompt_hash,
-                glossary_hash_value=gh,
+                glossary_hash_value=unit_terms_hash,
                 context_hash_value=ctx_hash,
             )
             if cached:
@@ -305,6 +360,7 @@ def run_pipeline(
                     status="model",
                     origin="model-cache",
                     knowledge_ref=cached["cache_key"],
+                    required_terms=unit_terms,
                 )
                 mark_item(project_db, job_id, unit["unit_id"], "cache" if safe else "rejected")
                 project_db.commit()
@@ -312,13 +368,9 @@ def run_pipeline(
                     _emit_target(event, project_db, unit, cached["target_text"], origin="cache", job_id=job_id)
                 continue
 
-            item = project_db.execute(
-                "SELECT status FROM job_items WHERE job_id=? AND unit_id=?",
-                (job_id, unit["unit_id"]),
-            ).fetchone()
-            if item and item["status"] in ("tm", "reference", "cache", "model", "skipped"):
+            if item_state and item_state["status"] in ("tm", "reference", "cache", "model", "skipped"):
                 continue
-            model_queue.append((unit, ctx, ctx_hash))
+            model_queue.append((unit, ctx, ctx_hash, unit_terms, unit_terms_hash))
 
         batch_size = max(1, int(batch_size))
         total_model = len(model_queue)
@@ -331,47 +383,53 @@ def run_pipeline(
                 return summary
 
             batch = model_queue[offset : offset + batch_size]
-            merged_terms: dict[tuple[str, str], dict[str, Any]] = {}
             request_items: list[dict[str, Any]] = []
-            for unit, ctx, _ctx_hash in batch:
-                for term in relevant_glossary_terms(knowledge_db, unit["source_text"]):
-                    merged_terms[(term["source"], term["target"])] = term
+            for unit, ctx, _ctx_hash, unit_terms, _unit_terms_hash in batch:
                 request_items.append(
-                    {"id": unit["unit_id"], "source": unit["source_text"], "context": ctx}
-                )
-                mark_item(project_db, job_id, unit["unit_id"], "pending", increment_attempt=True)
-            project_db.commit()
-
-            try:
-                results = translator.translate_batch(request_items, list(merged_terms.values()))
-            except Exception as exc:
-                for unit, _ctx, _ctx_hash in batch:
-                    mark_item(project_db, job_id, unit["unit_id"], "failed", error=str(exc))
-                project_db.commit()
-                refresh_job_counts(project_db, job_id)
-                event(
                     {
-                        "event": "batch-error",
-                        "phase": "vnext-translate",
-                        "job_id": job_id,
-                        "message": str(exc),
-                        "offset": offset,
-                        "count": len(batch),
+                        "id": unit["unit_id"],
+                        "source": unit["source_text"],
+                        "context": ctx,
+                        "terminology": unit_terms,
                     }
                 )
-                continue
+                mark_item(
+                    project_db,
+                    job_id,
+                    unit["unit_id"],
+                    "pending",
+                    increment_attempt=True,
+                )
+            project_db.commit()
 
-            for unit, _ctx, ctx_hash in batch:
+            results, errors = _translate_resilient(translator, request_items)
+            for unit, _ctx, ctx_hash, unit_terms, unit_terms_hash in batch:
+                error = errors.get(unit["unit_id"])
+                if error:
+                    mark_item(project_db, job_id, unit["unit_id"], "failed", error=error)
+                    event(
+                        {
+                            "event": "item-error",
+                            "phase": "vnext-translate",
+                            "job_id": job_id,
+                            "unit_id": unit["unit_id"],
+                            "message": error,
+                        }
+                    )
+                    continue
+
                 target = str(results.get(unit["unit_id"]) or "").strip()
                 if not target:
                     mark_item(project_db, job_id, unit["unit_id"], "failed", error="模型没有返回译文")
                     continue
+
                 safe = _safe_apply(
                     project_db,
                     unit,
                     target,
                     status="model",
                     origin=f"model:{translator.model}",
+                    required_terms=unit_terms,
                 )
                 if safe:
                     cache_key = put_model_cache(
@@ -380,7 +438,7 @@ def run_pipeline(
                         target,
                         model=translator.model,
                         prompt_hash=translator.prompt_hash,
-                        glossary_hash_value=gh,
+                        glossary_hash_value=unit_terms_hash,
                         context_hash_value=ctx_hash,
                     )
                     _set_target(
@@ -396,6 +454,7 @@ def run_pipeline(
                     _emit_target(event, project_db, unit, target, origin="model", job_id=job_id)
                 else:
                     mark_item(project_db, job_id, unit["unit_id"], "rejected", error="QA rejected model output")
+
             project_db.commit()
             checkpoint = refresh_job_counts(project_db, job_id)
             event(
@@ -428,7 +487,10 @@ def run_pipeline(
 
 def _summary(db: sqlite3.Connection, job_id: str) -> dict[str, Any]:
     checkpoint = refresh_job_counts(db, job_id)
-    row = db.execute("SELECT status,last_error FROM translation_jobs WHERE job_id=?", (job_id,)).fetchone()
+    row = db.execute(
+        "SELECT status,last_error FROM translation_jobs WHERE job_id=?",
+        (job_id,),
+    ).fetchone()
     counts = {
         r["status"]: r["n"]
         for r in db.execute(
@@ -449,7 +511,10 @@ def stop_latest_job(project_db_path: Path, job_id: str = "") -> dict[str, Any]:
     db = init_project_db(Path(project_db_path))
     try:
         if job_id:
-            row = db.execute("SELECT job_id FROM translation_jobs WHERE job_id=?", (job_id,)).fetchone()
+            row = db.execute(
+                "SELECT job_id FROM translation_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
         else:
             row = latest_job(db)
         if not row:
