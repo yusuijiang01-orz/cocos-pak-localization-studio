@@ -14,7 +14,7 @@ SYSTEM_PROMPT = """你是越南语 MMORPG 到简体中文的专业游戏本地�
 规则：
 1. 完整理解整句语义并按中文语序重写，不得输出“每 日 能 有”这类逐词拼接中文。
 2. 输入可能是 UI 短语、对白、任务说明、人名、地名、技能、装备或中越混合旧文本。
-3. terminology 中出现的术语必须采用给定中文；未出现的专名结合 context 自然意译或音译。
+3. 每个 item 的 terminology 是该条文本真正命中的术语约束，必须采用其给定中文。
 4. 输出自然语言不得残留越南语。NPC、PVP、PK、HP、MP、EXP、ID、UI、URL 等通用缩写可以保留。
 5. 不添加解释、Markdown、引号或额外说明。
 6. 只返回要求的 JSON 数组，id 必须与输入逐项一致。"""
@@ -38,7 +38,7 @@ class OllamaEngine:
         )
         self.model = self.config.model
         self.prompt_hash = hashlib.sha256(
-            ("vnext-phase2\0" + SYSTEM_PROMPT).encode("utf-8")
+            ("vnext-phase2.1\0" + SYSTEM_PROMPT).encode("utf-8")
         ).hexdigest()
 
     def _request(self, messages: list[dict[str, str]], count: int) -> str:
@@ -89,7 +89,7 @@ class OllamaEngine:
             return {}
         expected = [str(item["id"]) for item in items]
         user_payload = {
-            "terminology": [
+            "batch_terminology": [
                 {"source": term["source"], "target": term["target"]}
                 for term in terminology
             ],
@@ -98,6 +98,10 @@ class OllamaEngine:
                     "id": str(item["id"]),
                     "source": str(item["source"]),
                     "context": item.get("context") or {},
+                    "terminology": [
+                        {"source": term["source"], "target": term["target"]}
+                        for term in (item.get("terminology") or [])
+                    ],
                 }
                 for item in items
             ],
@@ -108,7 +112,8 @@ class OllamaEngine:
                 "role": "user",
                 "content": (
                     "把 items 中每个 source 翻译成自然简体中文。"
-                    "严格应用 terminology。返回与 items 等长的 JSON 数组："
+                    "每条只强制应用该 item 自己的 terminology；batch_terminology 只是全集参考。"
+                    "返回与 items 等长的 JSON 数组："
                     '[{"id":"原id","text":"中文译文"}]。\n'
                     + json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
                 ),
