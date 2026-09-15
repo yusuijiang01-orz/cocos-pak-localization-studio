@@ -2,7 +2,7 @@
   "name": "cocos-pak-localization-studio-file-queue",
   "version": "4.0.0",
   "description": "按文件队列翻译的 Cocos2D / Kingsoft PACK 本地化 Studio",
-  "main": "electron/main_with_glossary.js",
+  "main": "electron/main_with_glossary_resume.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron ."
