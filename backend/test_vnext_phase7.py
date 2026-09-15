@@ -11,8 +11,10 @@ from pathlib import Path
 from localization_analyzer import decode_best
 from pak_builder import nrv2b_compress
 from pak_core import extract_one
+from xlsx_localization import write_simple_xlsx
 from vnext.build import build_verified_paks, preflight_build
 from vnext.database import init_knowledge_db, init_project_db, utcnow
+from vnext.phase7 import audit_xlsx_corpus, workspace_readiness
 from vnext.workspace_ingest import ingest_workspace_records
 
 
@@ -206,6 +208,34 @@ class Phase7EndToEndTests(unittest.TestCase):
         )
         self.assertFalse(gate['ok'])
         self.assertGreater(gate['blocker_count'], 0)
+
+    def test_corpus_audit_requires_all_three_paks_and_counts_normalized_reuse(self):
+        xlsx = self.root / 'corpus.xlsx'
+        write_simple_xlsx(
+            xlsx,
+            [
+                {'id': 'a', 'pak': 'settings.pak', 'source_file': 'a.ini', 'text': 'Nhiệm   vụ'},
+                {'id': 'b', 'pak': 'settings.pak', 'source_file': 'b.ini', 'text': 'Nhiệm vụ'},
+                {'id': 'c', 'pak': 'updatefs.pak', 'source_file': 'c.tsv', 'text': 'Băng Hỏa Long Châu'},
+                {'id': 'd', 'pak': 'ui.pak', 'source_file': 'd.txt', 'text': 'Nhận thưởng'},
+            ],
+            headers=['id', 'pak', 'source_file', 'text'],
+        )
+        report = audit_xlsx_corpus(xlsx)
+        self.assertTrue(report['ok'], report)
+        self.assertEqual(report['rows'], 4)
+        self.assertEqual(report['normalized_unique'], 3)
+        self.assertEqual(report['normalization_reuse'], 1)
+        self.assertEqual(set(report['pak_counts']), {'settings.pak', 'updatefs.pak', 'ui.pak'})
+
+    def test_readiness_check_does_not_create_missing_project_database(self):
+        workspace = self.root / 'readiness-only'
+        (workspace / 'localization').mkdir(parents=True)
+        (workspace / 'localization' / 'text_records.json').write_text('[]', encoding='utf-8')
+        report = workspace_readiness(workspace, knowledge_db_path=self.knowledge_db)
+        self.assertFalse(report['ok'])
+        self.assertFalse((workspace / 'vnext' / 'project.sqlite3').exists())
+        self.assertEqual(report['sync']['state'], 'never_synced')
 
 
 if __name__ == '__main__':
