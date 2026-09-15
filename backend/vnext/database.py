@@ -78,6 +78,24 @@ CREATE TABLE IF NOT EXISTS qa_findings(
   resolved INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_qa_unit ON qa_findings(unit_id,resolved,severity);
+CREATE TABLE IF NOT EXISTS review_items(
+  unit_id TEXT PRIMARY KEY REFERENCES translation_units(unit_id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'pending',priority INTEGER NOT NULL DEFAULT 100,
+  reason_code TEXT NOT NULL,severity TEXT NOT NULL DEFAULT 'warning',
+  source_snapshot TEXT NOT NULL,target_snapshot TEXT NOT NULL DEFAULT '',
+  target_fingerprint TEXT NOT NULL DEFAULT '',qa_codes_json TEXT NOT NULL DEFAULT '[]',
+  occurrence_count INTEGER NOT NULL DEFAULT 0,note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_state_priority ON review_items(state,priority DESC,updated_at);
+CREATE TABLE IF NOT EXISTS review_actions(
+  action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_id TEXT NOT NULL REFERENCES translation_units(unit_id) ON DELETE CASCADE,
+  action TEXT NOT NULL,before_target TEXT NOT NULL DEFAULT '',after_target TEXT NOT NULL DEFAULT '',
+  tm_id INTEGER NOT NULL DEFAULT 0,note TEXT NOT NULL DEFAULT '',detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_actions_unit ON review_actions(unit_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS build_snapshots(
   build_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,source_manifest_json TEXT NOT NULL,
   target_manifest_json TEXT NOT NULL DEFAULT '{}',verification_json TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL
@@ -191,7 +209,7 @@ def lookup_tm(db: sqlite3.Connection, source_text: str, *, target_lang: str = "z
       ORDER BY locked DESC,CASE quality WHEN 'manual' THEN 6 WHEN 'approved' THEN 5 WHEN 'reference' THEN 4
       WHEN 'reviewed' THEN 3 WHEN 'seed' THEN 2 ELSE 1 END DESC LIMIT 1""",(skey,target_lang)).fetchone()
     if row:
-        db.execute("UPDATE translation_memory SET usage_count=usage_count+1,updated_at=? WHERE tm_id=?",(utcnow(),row["tm_id"])); db.commit()
+        db.execute('UPDATE translation_memory SET usage_count=usage_count+1,updated_at=? WHERE tm_id=?',(utcnow(),row['tm_id'])); db.commit()
     return row
 
 
