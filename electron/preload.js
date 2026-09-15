@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('studio', {
   importXlsxPolish: (payload) => ipcRenderer.invoke('import-xlsx-polish', payload),
   exportFullXlsx: (payload) => ipcRenderer.invoke('export-full-xlsx', payload),
   exportGlossaryXlsx: (payload) => ipcRenderer.invoke('export-glossary-xlsx', payload),
+  glossaryTranslate: (payload) => ipcRenderer.invoke('glossary-translate', payload),
   importFullXlsx: (payload) => ipcRenderer.invoke('import-full-xlsx', payload),
   exportUntranslatedXlsx: (payload) => ipcRenderer.invoke('export-untranslated-xlsx', payload),
   ollamaTranslate: (payload) => ipcRenderer.invoke('ollama-translate', payload),
