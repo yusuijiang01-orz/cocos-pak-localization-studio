@@ -26,6 +26,7 @@ from .knowledge import (
     terms_hash,
 )
 from .qa import evaluate_translation, is_build_safe
+from .review import is_target_blocked
 
 
 EventCallback = Callable[[dict[str, Any]], None]
@@ -136,7 +137,7 @@ def _set_target(
 
 
 def _save_findings(db: sqlite3.Connection, unit_id: str, findings) -> None:
-    db.execute("DELETE FROM qa_findings WHERE unit_id=? AND resolved=0", (unit_id,))
+    db.execute("UPDATE qa_findings SET resolved=1 WHERE unit_id=? AND resolved=0", (unit_id,))
     now = utcnow()
     for item in findings:
         db.execute(
@@ -237,6 +238,19 @@ def _translate_resilient(
         return left_values, left_errors
 
 
+def _blocked_event(event: EventCallback, job_id: str, unit: sqlite3.Row, origin: str) -> None:
+    event(
+        {
+            "event": "blocked-candidate",
+            "phase": "vnext-translate",
+            "job_id": job_id,
+            "unit_id": unit["unit_id"],
+            "origin": origin,
+            "message": "该译文已被人工拒绝，本项目不会再次自动采用同一结果",
+        }
+    )
+
+
 def run_pipeline(
     project_db_path: Path,
     *,
@@ -306,7 +320,7 @@ def run_pipeline(
                 continue
 
             tm = lookup_trusted_tm(knowledge_db, unit["source_text"])
-            if tm:
+            if tm and not is_target_blocked(project_db, unit["unit_id"], tm["target_text"]):
                 safe = _safe_apply(
                     project_db,
                     unit,
@@ -321,9 +335,11 @@ def run_pipeline(
                 if safe:
                     _emit_target(event, project_db, unit, tm["target_text"], origin="tm", job_id=job_id)
                 continue
+            if tm:
+                _blocked_event(event, job_id, unit, "tm")
 
             ref = lookup_reference(knowledge_db, unit["source_text"])
-            if ref:
+            if ref and not is_target_blocked(project_db, unit["unit_id"], ref["canonical_zh"]):
                 safe = _safe_apply(
                     project_db,
                     unit,
@@ -338,6 +354,8 @@ def run_pipeline(
                 if safe:
                     _emit_target(event, project_db, unit, ref["canonical_zh"], origin="reference", job_id=job_id)
                 continue
+            if ref:
+                _blocked_event(event, job_id, unit, "reference")
 
             ctx = _context_for_unit(project_db, unit["unit_id"])
             ctx_hash = context_hash(ctx)
@@ -352,7 +370,7 @@ def run_pipeline(
                 glossary_hash_value=unit_terms_hash,
                 context_hash_value=ctx_hash,
             )
-            if cached:
+            if cached and not is_target_blocked(project_db, unit["unit_id"], cached["target_text"]):
                 safe = _safe_apply(
                     project_db,
                     unit,
@@ -367,6 +385,8 @@ def run_pipeline(
                 if safe:
                     _emit_target(event, project_db, unit, cached["target_text"], origin="cache", job_id=job_id)
                 continue
+            if cached:
+                _blocked_event(event, job_id, unit, "cache")
 
             if item_state and item_state["status"] in ("tm", "reference", "cache", "model", "skipped"):
                 continue
@@ -421,6 +441,11 @@ def run_pipeline(
                 target = str(results.get(unit["unit_id"]) or "").strip()
                 if not target:
                     mark_item(project_db, job_id, unit["unit_id"], "failed", error="模型没有返回译文")
+                    continue
+
+                if is_target_blocked(project_db, unit["unit_id"], target):
+                    mark_item(project_db, job_id, unit["unit_id"], "failed", error="模型再次返回人工拒绝过的译文")
+                    _blocked_event(event, job_id, unit, "model")
                     continue
 
                 safe = _safe_apply(
