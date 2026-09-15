@@ -2,12 +2,33 @@
   const button = document.getElementById('glossaryTranslate');
   if (!button) return;
 
+  let running = false;
+  let stopping = false;
+  const normalLabel = '术语库翻译';
+
+  function updateButtonState() {
+    if (!running) {
+      button.textContent = normalLabel;
+      button.disabled = false;
+      button.classList.remove('danger');
+      return;
+    }
+    button.classList.add('danger');
+    if (stopping) {
+      button.textContent = '正在停止并保存…';
+      button.disabled = true;
+    } else {
+      button.textContent = '停止术语库翻译';
+      button.disabled = false;
+    }
+  }
+
   if (typeof setWorkflowDisabled === 'function') {
     const originalSetWorkflowDisabled = setWorkflowDisabled;
     setWorkflowDisabled = function (disabled) {
       originalSetWorkflowDisabled(disabled);
-      const glossaryButton = document.getElementById('glossaryTranslate');
-      if (glossaryButton) glossaryButton.disabled = !!disabled;
+      if (running) updateButtonState();
+      else button.disabled = !!disabled;
     };
   }
 
@@ -35,15 +56,15 @@
     return null;
   }
 
-  // app.js already listens to backend-progress globally.  It does not know this
-  // extra workflow, so consume glossary progress here as a second listener.
-  // applyLiveTranslationUpdates() updates current rows, language counters,
-  // Chinese/Vietnamese filters and status counts while the backend is running.
   if (window.studio && typeof window.studio.onProgress === 'function') {
     window.studio.onProgress(d => {
       if (!d || d.phase !== 'glossary-translate') return;
       if (Array.isArray(d.updates) && typeof applyLiveTranslationUpdates === 'function') {
         applyLiveTranslationUpdates(d.updates);
+      }
+      if (d.stopping) {
+        stopping = true;
+        updateButtonState();
       }
       progressValue(
         Number(d.percent || 0),
@@ -55,6 +76,26 @@
   }
 
   button.onclick = async () => {
+    if (running) {
+      if (stopping) return;
+      stopping = true;
+      updateButtonState();
+      progressMessage('正在停止术语库翻译并保存断点；已完成内容不会丢失…');
+      try {
+        const stopped = await window.studio.glossaryTranslateCancel();
+        if (!stopped?.ok) {
+          stopping = false;
+          updateButtonState();
+          alert(stopped?.error || '停止术语库翻译失败');
+        }
+      } catch (e) {
+        stopping = false;
+        updateButtonState();
+        alert(e?.message || String(e));
+      }
+      return;
+    }
+
     if (typeof project === 'undefined' || !project) {
       alert('请先打开或导入项目');
       return;
@@ -64,15 +105,26 @@
       return;
     }
 
+    running = true;
+    stopping = false;
+    updateButtonState();
     try {
       if (typeof setWorkflowDisabled === 'function') setWorkflowDisabled(true);
-      else button.disabled = true;
       if (typeof startTranslationClock === 'function') startTranslationClock();
       progressValue(1, '请选择要应用术语库翻译的导出 XLSX，然后选择已翻译的术语库 XLSX…');
 
       const res = await window.studio.glossaryTranslate({ project, pak: selectedPak() });
       if (res?.canceled) {
-        progressValue(0, '已取消术语库翻译');
+        if (typeof refreshRecordsFromResult === 'function') refreshRecordsFromResult(res);
+        const done = Number(res.processedRows ?? res.report?.processed_rows ?? 0);
+        const total = Number(res.totalRows ?? res.report?.workbook_rows ?? 0);
+        if (res.saved && res.resumable) {
+          const msg = `术语库翻译已停止。已完成译文已经写回项目，断点保存为 ${done.toLocaleString()}/${total.toLocaleString()}。下次选择同一个导出 XLSX 和同一个术语库 XLSX，会从该断点继续，不会从 0 开始。`;
+          progressValue(total ? done / total * 100 : 0, msg, null, { completed_rows: done, total_rows: total });
+          alert(msg, { title: '已停止并保存断点', tone: 'success' });
+        } else {
+          progressValue(0, '已取消术语库翻译');
+        }
         return;
       }
       if (!res?.ok) {
@@ -81,8 +133,6 @@
         return;
       }
 
-      // Final authoritative reload from text_records.json.  Live updates above
-      // are only a preview until the existing importer/materializer succeeds.
       if (typeof refreshRecordsFromResult === 'function') refreshRecordsFromResult(res);
       else if (res.records && typeof records !== 'undefined') {
         records = res.records;
@@ -95,13 +145,17 @@
       const imported = res.importReport || res.import || {};
       const sync = res.resourceSync?.report || res.sync || {};
       const partial = Number(report.partial_rows || 0);
-      const message = `术语库翻译完成：完整中文 ${report.translated_rows || 0} 行，部分命中未写入 ${partial} 行，命中术语 ${report.matched_terms || 0} 次，导入变化 ${imported.changed || 0} 条，生成资源 ${sync.changed_file_count || 0} 个。现在可以直接构建 PAK。`;
+      const resumed = Number(report.resumed_from || 0);
+      const resumeText = resumed ? `，本次从 ${resumed.toLocaleString()} 行断点继续` : '';
+      const message = `术语库翻译完成${resumeText}：完整中文 ${report.translated_rows || 0} 行，部分命中未写入 ${partial} 行，命中术语 ${report.matched_terms || 0} 次，导入变化 ${imported.changed || 0} 条，生成资源 ${sync.changed_file_count || 0} 个。现在可以直接构建 PAK。`;
       progressValue(100, message);
-      alert(`${message}\n\n说明：只有整段替换后不再残留越南文/拉丁字符的内容才会写回，避免中越混合译文进入 PAK。\n\n生成的可导入 XLSX：\n${res.translatedXlsx || ''}`);
+      alert(`${message}\n\n只有整段替换后不再残留越南文/拉丁字符的内容才会写回，避免中越混合译文进入 PAK。\n\n生成的可导入 XLSX：\n${res.translatedXlsx || ''}`);
     } finally {
       if (typeof stopTranslationClock === 'function') stopTranslationClock();
+      running = false;
+      stopping = false;
       if (typeof setWorkflowDisabled === 'function') setWorkflowDisabled(false);
-      else button.disabled = false;
+      updateButtonState();
     }
   };
 }());
