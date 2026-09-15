@@ -32,6 +32,18 @@ class VNextPhase1Tests(unittest.TestCase):
         mixed = classify_source("完成 nhiệm vụ")
         self.assertEqual(mixed.language, SourceLanguage.MIXED)
 
+    def test_valid_vietnamese_a_circumflex_is_not_mojibake(self):
+        # Real game strings contain names such as Ân Hồng/Ân Giao.  A previous
+        # mojibake regex matched every standalone Â and excluded these rows from
+        # the automatic translation pipeline.
+        valid = classify_source("Bạn có thể đến Phong Thần đài tìm Ân Hồng bắt đầu nhiệm vụ")
+        self.assertEqual(valid.language, SourceLanguage.VI)
+        self.assertNotEqual(valid.kind, UnitKind.CORRUPT_SOURCE)
+        self.assertNotIn("possible_mojibake", valid.risk_flags)
+        broken = classify_source("TÃªn nhân vật")
+        self.assertIn("possible_mojibake", broken.risk_flags)
+        self.assertEqual(broken.kind, UnitKind.CORRUPT_SOURCE)
+
     def test_out_of_band_protection(self):
         text = "$Hoàn thành nhiệm vụ <c=green>{0}</c>"
         pieces = split_runtime_text(text)
